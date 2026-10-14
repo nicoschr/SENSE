@@ -1,0 +1,45 @@
+# Hydrogen case study — machine-specific configuration
+#
+# Copy this file to `config.local.yaml`, then edit only that ignored copy:
+# See README step 2 for a Windows/macOS command that preserves an existing file.
+#
+# Relative paths resolve from this case-study directory. Absolute paths and
+# paths beginning with `~` are also accepted.
+
+brightway:
+  # Version-specific names prevent an older ecoinvent project being reused.
+  project: sense_hydrogen_ei312
+  regioinvent_database: Regioinvent
+
+# The fixed manuscript design is documented in REFERENCE.md.
+# Both aggregation alternatives live in this project, on separate sociospheres.
+
+# Fixed study versions; use the general SENSE API for other database releases.
+versions:
+  ecoinvent: "3.12"
+  psilca: "4.0"
+
+paths:
+  # Generated SENSE caches and case-study results are written below this folder.
+  data_dir: Data
+
+  # Main case-study inputs.
+  ecoinvent_geographies_excel: Data/ecoinvent/Database-Overview-for-ecoinvent-v3.12.xlsx
+  # PSILCA v4 - Professional, openLCA backup (.zolca), licensed.
+  # The case study used: psilca_professional_work_hours_cutoff_1.0E-7_20250624-clean.zolca
+  # No openLCA installation or manual XML export is required.
+  psilca_path: Data/psilca/psilca.zolca
+  hydrogen_inventory: Data/inventories/3.12/hydrogen_inventories_ei312.xlsx
+  methanol_inventory: Data/inventories/3.12/methanol_inventories_ei312.xlsx
+
+  # Optional. SOCA v5 (the build for ecoinvent 3.12) is read only by the benchmark
+  # and by `check_setup.py --include-validation`; it does not affect the hydrogen
+  # results in the hydrogen stages. If you do not have SOCA, set this to null or
+  # remove the key. Validation uses the same ecoinvent 3.12 datasets and Database
+  # Overview configured above. To export SOCA from openLCA, see step 8 of README.md.
+  soca_dir: Data/soca/EcoSpold01
+
+ecoinvent_credentials:
+  # Replace both null values in the ignored local copy. Quote the values.
+  username: null
+  password: null

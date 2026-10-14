@@ -1,0 +1,16 @@
+{
+  "sha256": "f585ae8588ac69254f2a2d44bf2023924a06969d221f9e46689245a25ca186fc",
+  "reconstruction_script_sha256": "8930f6418fdf25d54fc701377469d734e862fadb0d7b4c057a2dcdc176ff4275",
+  "lambda": 0.1,
+  "grid_start": 0,
+  "grid_end": 0.05,
+  "grid_step": 0.001,
+  "selection_subset": "DEV/high-resolution (90 activities)",
+  "selected_delta": [
+    0.028
+  ],
+  "top50_truncation": false,
+  "cross_model_label_conflicts": 0,
+  "limits": "Single-author plausibility labels; reconstructed grid; no new model inference. Test results do not select the threshold.",
+  "scope": "Aggregate results of the original labelled audit. Raw activity descriptions, candidate-sector labels and author judgements are not distributed."
+}

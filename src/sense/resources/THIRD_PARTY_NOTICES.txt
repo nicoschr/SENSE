@@ -1,0 +1,138 @@
+Third-party data and external resources
+=======================================
+
+These terms are separate from the MIT licence for SENSE code.
+Source and licence information last checked on 2026-10-08.
+
+1. Bundled World Bank GDP snapshot
+
+world_bank_gdp_current_usd_2000_2024.csv contains observations of the World
+Development Indicators series GDP (current US$) (NY.GDP.MKTP.CD) for
+2000–2024. It was obtained through the World Bank API and incorporated into
+SENSE on 2026-09-03.
+
+Source: World Bank national accounts data and OECD National Accounts data
+files, distributed through the World Bank Open Data API:
+https://api.worldbank.org/v2/country/all/indicator/NY.GDP.MKTP.CD
+
+The World Bank: World Development Indicators: GDP (current US$), indicator
+NY.GDP.MKTP.CD. The indicator page explicitly identifies CC BY 4.0:
+https://data.worldbank.org/indicator/NY.GDP.MKTP.CD
+Licence: https://creativecommons.org/licenses/by/4.0/
+Additional World Bank terms: https://data.worldbank.org/summary-terms-of-use
+Retain this attribution and those terms when redistributing the snapshot.
+The bundled CSV selects and reformats API observations for 2000-2024;
+SENSE-derived weights are not original World Bank observations.
+
+SENSE uses these values only to calculate relative country GDP shares. The
+weights and resulting SENSE outputs are transformations produced by SENSE;
+they are not official World Bank products. No endorsement by the World Bank is
+implied.
+
+Snapshot SHA-256:
+036464d18a3ac248ef66fc1e9d8a37c892724b1579f423c3821730c988210792
+
+2. Bundled monetary constants
+
+src/sense/monetary.py contains selected euro-area HICP annual-average indices
+from Eurostat (PRC_HICP_AIND) and annual-average USD/EUR reference rates from
+the European Central Bank. Data accessed 2026-09-03.
+
+Eurostat source: https://doi.org/10.2908/PRC_HICP_AIND
+Reuse terms: https://ec.europa.eu/eurostat/help/copyright-notice
+The indices used here are for the euro area. SENSE calculates index ratios
+and currency-conversion factors; these transformations are SENSE's responsibility,
+not Eurostat's. Eurostat bears no responsibility for this use or interpretation.
+
+ECB source: https://data.ecb.europa.eu/data/datasets/EXR
+Copyright and reuse terms:
+https://www.ecb.europa.eu/services/using-our-site/disclaimer/html/index.en.html
+The original rate information is available free of charge from the ECB.
+If ECB information is incorporated in documents sold to users, the publisher
+must tell buyers that the information is available free from the ECB, before
+payment and each time they access it. Modifications must be identified.
+SENSE combines these rates with HICP ratios to calculate its own conversion
+factors. The ECB is the source of the rates, not the calculated SENSE factors.
+Retain source attribution and the applicable reuse conditions.
+
+3. Public methodology references
+
+The default risk/opportunity scale is implemented as model settings, not as
+country-sector assessments. The public PSILCA v3 manual, section 3.8, Table 3,
+describes exponential level factors and the no-data factor:
+https://psilca.net/wp-content/uploads/2020/06/PSILCA_documentation_v3.pdf
+SENSE assigns 0.001 to "no" to retain positivity for geometric averaging; the
+manual assigns zero. This deviation is a SENSE modelling choice, not a copied
+sector observation. No manual or assessment table is redistributed.
+
+4. Downloaded or user-provided inputs (not bundled)
+
+The default BAAI/bge-base-en-v1.5 embedding model is downloaded at runtime.
+Its model card identifies the MIT licence:
+https://huggingface.co/BAAI/bge-base-en-v1.5
+The hydrogen foreground stage separately downloads
+sentence-transformers/all-MiniLM-L6-v2, whose model card identifies Apache
+License 2.0: https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2
+The pinned model revisions are recorded in src/sense/data/embeddings.py.
+Model weights are not included in SENSE distributions.
+
+The optional hydrogen example downloads Regioinvent trade data from the
+provider's pinned record: https://doi.org/10.5281/zenodo.20596474
+The record declares CC BY 4.0. That database is not redistributed with SENSE.
+Consult the record and the original providers' terms before reusing or
+redistributing downloaded inputs.
+
+Ecoinvent, PSILCA, SOCA, ecoinvent overview workbooks, and foreground workbooks
+(including their study-selection and settings sheets)
+must be supplied or obtained by the user under their applicable terms. None
+is included in the SENSE 1.1.0 distributions. Separately installed Python
+dependencies retain their respective licences.
+
+5. Bundled IMF WEO GDP fallback
+
+Source: International Monetary Fund, World Economic Outlook (April 2026).
+https://www.imf.org/external/datamapper/NGDPD@WEO
+Indicator: NGDPD, GDP at current prices, billions of US dollars.
+API data and metadata accessed 2026-09-23.
+
+imf_weo_gdp_current_usd_2000_2024.csv selects individual-economy estimates for
+2000-2024, converts billions of US dollars to dollars, and maps IMF UVK to XKX
+and WBG to PSE. Regional totals and years after 2024 are excluded. The companion
+JSON records source metadata, raw-response hashes, and the transformed CSV hash.
+These historical WEO estimates need not be directly measured national observations.
+The original World Bank snapshot is unchanged; IMF supplies a value only when
+World Bank has none usable within the configured year window.
+
+IMF statistical data are subject to their own terms, not the SENSE MIT licence
+or the World Bank CC BY 4.0 licence:
+https://www.imf.org/en/about/copyright-and-terms
+The section "The Use of IMF Data" permits distribution and transformation with
+accurate source attribution and disclosure of transformations; consult that
+section and its conditions, including its direction to contact the IMF for
+potential commercial reuse. Communicate these terms when redistributing data.
+IMF data are available free from the IMF. The dollar conversion and weights are
+SENSE transformations, not official IMF products; no IMF endorsement is implied.
+
+6. Bundled native database reader
+
+resources/zolca/reader.jar contains SENSE's Java reader and the public Apache
+Derby engine/shared modules 10.17.1.0. It contains no openLCA application code,
+PSILCA database, matrix, assessment or licensed input. The SENSE Java sources
+are distributed under the repository MIT licence. Apache Derby is distributed
+under Apache License 2.0. Its original LICENSE and NOTICE files are retained
+inside the JAR, including copyright and attribution notices.
+
+Public dependency sources:
+https://repo.maven.apache.org/maven2/org/apache/derby/derby/10.17.1.0/
+https://repo.maven.apache.org/maven2/org/apache/derby/derbyshared/10.17.1.0/
+Project and source: https://db.apache.org/derby/
+
+Verified upstream SHA-256 values:
+derby: 764e4c133f860a8876e835ef2306efecad27a742d27f05bc4bce669432c6b397
+derbyshared: fb68bab30785375c1f8cb5e9583b349750f8904d6f7ee15ce8e1c30b6be30ef4
+
+Rebuild with tools/build_zolca_reader.py using Java 21. The script verifies
+the public dependencies, compiles the included sources and writes a deterministic
+JAR. Normal package installation uses the bundled artifact without downloading
+Java code. Java itself is supplied separately, for example by Conda openjdk=21,
+and retains its own licence.

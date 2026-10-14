@@ -1,0 +1,27 @@
+{
+  "schema": 1,
+  "target_java_release": 21,
+  "compiler": "javac 21.0.10",
+  "java_runtime": "openjdk version \"21.0.10\" 2026-01-20 LTS\nOpenJDK Runtime Environment Zulu21.48+17-CA (build 21.0.10+7-LTS)\nOpenJDK 64-Bit Server VM Zulu21.48+17-CA (build 21.0.10+7-LTS, mixed mode, sharing)",
+  "compiler_kind": "javac",
+  "compiler_sha256": null,
+  "compile_options": [
+    "--release=21",
+    "-encoding=UTF-8"
+  ],
+  "sources": {
+    "ArchiveResources.java": "77fccc1a5d97b203f67d6a72b3c3ba5d6ec40e3370d3359358ee9601f24fd94a",
+    "SenseZolcaReader.java": "4e5b8f6bb023245db7ac3206aef96e9da30f66bd9b55c5bc3beabe4d6a9e4e3a"
+  },
+  "dependencies": {
+    "derby": {
+      "version": "10.17.1.0",
+      "sha256": "764e4c133f860a8876e835ef2306efecad27a742d27f05bc4bce669432c6b397"
+    },
+    "derbyshared": {
+      "version": "10.17.1.0",
+      "sha256": "fb68bab30785375c1f8cb5e9583b349750f8904d6f7ee15ce8e1c30b6be30ef4"
+    }
+  },
+  "artifact_sha256": "6443f401c59774f288904dbd0f2ccc8bd2136fdc9bdf9aa831850722ec2a623a"
+}

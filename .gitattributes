@@ -1,0 +1,4 @@
+# Keep source and evidence fingerprints independent of checkout platform.
+* text=auto eol=lf
+# Bundled snapshots have published byte-level SHA-256 hashes; never rewrite them.
+src/sense/resources/*.csv -text

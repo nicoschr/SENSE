@@ -1,0 +1,153 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+    # Tags explicitly opt into the full verification suite.
+    tags: ['ci-full/**']
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      full_suite:
+        description: 'Run full Linux, Windows and both macOS suites (uses billed Actions minutes)'
+        type: boolean
+        default: false
+
+# Superseded pushes must not keep installing environments and running tests.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: Lightweight checks
+    # Same-repository PRs already have push checks; forks need the PR event.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install check tools only
+        run: python -m pip install 'ruff==0.16.5' 'black==26.5.1' build
+      - name: Check source and build distributions
+        run: |
+          ruff check src tests case_studies/hydrogen examples/*.py
+          black --check src tests case_studies/hydrogen/*.py case_studies/hydrogen/workflow/*.py examples/*.py
+          ruff format --check examples/*.ipynb
+          python -m compileall -q src tests case_studies/hydrogen examples
+          python -m build
+
+  setup-platforms:
+    if: (github.event_name == 'workflow_dispatch' && inputs.full_suite) || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/ci-full/'))
+    needs: checks
+    name: Setup (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-x64
+            runner: windows-2022
+            environment: environment.yml
+            solver: pardiso
+          - platform: macos-intel
+            runner: macos-15-intel
+            environment: environment-macos.yml
+            solver: umfpack
+          - platform: macos-arm64
+            runner: macos-15
+            environment: environment-macos.yml
+            solver: umfpack
+    defaults:
+      run:
+        shell: bash -el {0}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: conda-incubator/setup-miniconda@fc2d68f6413eb2d87b895e92f8584b5b94a10167 # v3
+        with:
+          miniforge-version: latest
+          activate-environment: sense
+          environment-file: ${{ matrix.environment }}
+          channel-priority: strict
+          auto-activate-base: false
+      - name: Install case-study and test dependencies
+        run: python -m pip install -e ".[case-study,dev]"
+      - name: Verify dependencies and record environment
+        run: |
+          python -m pip check
+          mkdir -p setup-evidence
+          conda list --explicit > setup-evidence/conda-explicit.txt
+          python -m pip freeze > setup-evidence/pip-freeze.txt
+      - name: Exercise the Python workflow environment
+        run: |
+          python tests/run_setup_smoke.py --solver ${{ matrix.solver }} --output setup-evidence
+      - name: Run regression tests
+        run: python -m pytest --junitxml=setup-evidence/pytest.xml
+      - name: Upload setup evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: setup-${{ matrix.platform }}
+          path: setup-evidence/
+          retention-days: 14
+
+  test:
+    name: Full Linux tests
+    if: (github.event_name == 'workflow_dispatch' && inputs.full_suite) || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/ci-full/'))
+    needs: checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Install package and development tools
+        run: |
+          python -m pip install --upgrade pip
+          # These runners have no GPU; avoid installing multi-GB CUDA libraries.
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install ".[dev,case-study]"
+          python -c "import torch; assert torch.version.cuda is None, 'CI requires CPU-only PyTorch'"
+      - name: Run tests
+        run: python -m pytest
+      - name: Lint and format check
+        run: |
+          ruff check src tests case_studies/hydrogen examples/*.py
+          black --check src tests case_studies/hydrogen/*.py case_studies/hydrogen/workflow/*.py examples/*.py
+          ruff format --check examples/*.ipynb
+      - name: Type check
+        run: |
+          mypy --check-untyped-defs src/sense case_studies/hydrogen/*.py case_studies/hydrogen/workflow/*.py examples/*.py
+      - name: Build distributions
+        run: python -m build
+      - name: Smoke-test the built wheel
+        run: |
+          python -m venv "$RUNNER_TEMP/sense-install"
+          "$RUNNER_TEMP/sense-install/bin/python" -m pip install --upgrade pip
+          "$RUNNER_TEMP/sense-install/bin/python" -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          for wheel in dist/*.whl; do
+            "$RUNNER_TEMP/sense-install/bin/python" -m pip install "$wheel[ecoinvent-import]" pytest
+          done
+          "$RUNNER_TEMP/sense-install/bin/python" -m pip check
+          "$RUNNER_TEMP/sense-install/bin/python" -c "import torch; assert torch.version.cuda is None, 'CI requires CPU-only PyTorch'"
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/sense-install/bin/sense" --version
+          "$RUNNER_TEMP/sense-install/bin/python" -c "import inspect, sys, sense; assert 'bw2data' not in sys.modules; from sense import SenseConfig, run_sense; import bw2io, sentence_transformers; assert 'price_source_db' in inspect.signature(run_sense).parameters; print(sense.__version__, SenseConfig())"
+          "$RUNNER_TEMP/sense-install/bin/python" -m pytest "$GITHUB_WORKSPACE/tests/test_release_regressions.py::test_social_flow_creation_and_type_separation_in_real_brightway" -o addopts=""

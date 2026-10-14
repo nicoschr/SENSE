@@ -1,141 +1,139 @@
-"""
-Ecoinvent data processing for SENSE.
-
-This module provides functions for:
-- Mapping ecoinvent locations to PSILCA countries
-- Extracting activities and prices from EcoSpold02 files
-- Creating embeddings for ecoinvent activities
-"""
+"""Prepare ecoinvent geographies, priced activities, and embedding stores."""
 
 from __future__ import annotations
 
 import json
+import logging
+import math
 import os
-import pickle
-import re
-import xml.etree.ElementTree as ET
-from collections import defaultdict
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from collections.abc import Sequence
+from pathlib import Path
+from typing import Any
 
-import numpy as np
 import pandas as pd
-from tqdm import tqdm
 
-from sense.data.embeddings import save_embeddings, prep_query_bge, BGE_QUERY_PROMPT, store_is_complete
-from sense.utils.helpers import norm_code
+from sense.artifacts import write_json_atomic
+from sense.brightway.repository import empty_inventory_keys, reference_production_amounts
+from sense.data.embeddings import (
+    BGE_QUERY_PROMPT,
+    _sha,
+    load_embeddings,
+    prep_query_bge,
+    save_embeddings,
+)
+from sense.data.price_inference import build_product_graph, run_product_inference
+from sense.data.prices import (
+    BrightwayPriceCatalog,
+    build_brightway_price_catalog,
+    prod_key,
+    reference_price_property,
+)
+from sense.data.seed_prices import (
+    build_minimal_seed_worklist,
+    load_seed_template,
+    write_or_merge_seed_template,
+)
+from sense.eligibility import exclusion_reason, is_treatment
+from sense.exceptions import SenseInputRequiredError
+from sense.geography import read_ecoinvent_geographies
+from sense.utils.helpers import norm_code, safe_name
+
+logger = logging.getLogger(__name__)
+
+
+def _embedding_store_matches_content(
+    out_dir: str,
+    base_name: str,
+    activities: pd.DataFrame,
+    expected_meta: dict[str, Any],
+) -> bool:
+    """Validate an embedding store by ID-to-text content, independent of row order."""
+
+    try:
+        vectors, stored_ids_series, manifest = load_embeddings(out_dir, base_name)
+    except (OSError, ValueError, KeyError, json.JSONDecodeError):
+        return False
+
+    stored_ids = [str(value) for value in stored_ids_series.tolist()]
+    expected_text = dict(
+        zip(
+            activities["code"].astype(str),
+            activities["text"].astype(str),
+            strict=True,
+        )
+    )
+    if (
+        len(stored_ids) != len(set(stored_ids))
+        or set(stored_ids) != set(expected_text)
+        or vectors.ndim != 2
+        or vectors.shape[0] != len(stored_ids)
+        or manifest.get("rows") != vectors.shape[0]
+        or manifest.get("dim") != vectors.shape[1]
+    ):
+        return False
+
+    stored_meta = manifest.get("meta") or {}
+    stable_meta = {key: value for key, value in expected_meta.items() if key != "input_hash"}
+    if any(stored_meta.get(key) != value for key, value in stable_meta.items()):
+        return False
+
+    texts_in_stored_order = [prep_query_bge(expected_text[code]) for code in stored_ids]
+    content_hash = _sha(json.dumps(texts_in_stored_order, ensure_ascii=False))
+    return stored_meta.get("input_hash") == content_hash
 
 
 def map_ecoinvent_locations(
     ecoinvent_excel_path: str,
-    psilca_sector_json_path: str,
+    psilca_sector_json_path: str | None = None,
 ) -> pd.DataFrame:
     """
-    Map ecoinvent geographies to PSILCA countries.
-    
+    Map ecoinvent geographies to country sets used by the selected workflow.
+
     This function translates all ecoinvent locations into sets of PSILCA-compatible
     ISO2 country codes. The mapping depends on geography classification:
-    
+
     - Countries present in PSILCA stay as-is (US -> US)
     - Subnational regions get assigned to their parent country (US-CO -> US)
     - Supranational regions get assigned all countries they contain (RER -> DE;FR;IT;...)
     - Countries not in PSILCA get assigned to the smallest overlapping region
     - Some locations require manual overrides
-    
+
     Args:
         ecoinvent_excel_path: Path to ecoinvent Database Overview Excel file
-        psilca_sector_json_path: Path to PSILCA sector JSON (country -> sectors)
-        
+        psilca_sector_json_path: PSILCA country-sector JSON. When omitted, retain
+            every country resolved from the ecoinvent geography workbook.
+
     Returns:
         DataFrame with columns including 'Shortname', 'simplified_ISO2', 'PSILCA_mapping'
     """
-    # Load ecoinvent locations Excel
-    ecoinvent_locations_df = pd.read_excel(ecoinvent_excel_path, sheet_name="Geographies")
+    ecoinvent_locations_df = read_ecoinvent_geographies(Path(ecoinvent_excel_path))
+
+    if psilca_sector_json_path is None:
+        ecoinvent_locations_df["PSILCA_mapping"] = ecoinvent_locations_df["simplified_ISO2"]
+        ecoinvent_locations_df["PSILCA_mapping_info"] = None
+        return ecoinvent_locations_df
 
     # Load PSILCA ISO2 -> sectors mapping from JSON
-    with open(psilca_sector_json_path, encoding='utf-8') as f:
+    with open(psilca_sector_json_path, encoding="utf-8") as f:
         psilca_sector_dict = json.load(f)
-
-    # Insert simplified_ISO2 column
-    shortname_index = ecoinvent_locations_df.columns.get_loc('Shortname')
-    ecoinvent_locations_df.insert(shortname_index + 1, 'simplified_ISO2', None)
-
-    def simplify_iso2(row):
-        geo_type = str(row['Geography Classification'])
-        shortname = str(row['Shortname'])
-        contained = str(row['Contained and Overlapping Geographies'])
-
-        # Countries stay as is
-        if 'Country' in geo_type:
-            return shortname
-        # Subnational regions get assigned to their parent country
-        elif 'Province or State' in geo_type:
-            if shortname[2] == '-':
-                return shortname[:2]
-            else:
-                return shortname
-        # Supranational regions get assigned all countries they contain
-        elif any(term in geo_type for term in [
-            'Aluminium Industry', 'ecoinvent Custom Area', 'ecoinvent Region',
-            'Electricity Grid', 'UN Region', 'UN Subregion', 'World'
-        ]):
-            codes = [code.strip() for code in contained.split(';')]
-            iso2_codes = [code for code in codes if re.fullmatch(r'[A-Z]{2}', code)]
-            return '; '.join(iso2_codes)
-        return None
-
-    ecoinvent_locations_df['simplified_ISO2'] = ecoinvent_locations_df.apply(simplify_iso2, axis=1)
-
-    # Clean up electricity grid data
-    mask = (
-        (ecoinvent_locations_df['Geography Classification'] == 'Electricity Grid') &
-        (ecoinvent_locations_df['simplified_ISO2'].isna() | 
-         (ecoinvent_locations_df['simplified_ISO2'].str.strip() == ''))
-    )
-    ecoinvent_locations_df.loc[mask, 'simplified_ISO2'] = \
-        ecoinvent_locations_df.loc[mask, 'Shortname'].str[:2]
-
-    # Manual overrides
-    manual_overrides = {
-        'Clipperton Island': 'FR', 'Canary Islands': 'ES',
-        'France, including overseas territories': 'FR',
-        'Australia, including overseas territories': 'AU', 'Puerto Rico': 'US',
-        'China without Inner Mongol': 'CN', 'Canada without Alberta': 'CA',
-        'Canada without Alberta and Quebec': 'CA', 'Canada without Quebec': 'CA',
-        'Russia (Europe)': 'RU', 'Russia (Asia)': 'RU', 'Coral Sea Islands': 'AU',
-        'Kosovo': 'XK', 'Serranilla Bank': 'CO', 'Spratly Islands': 'PH',
-        'Dhekelia Sovereign Base Area': 'CY', 'Serbia and Montenegro': 'RS',
-        'Cyprus No Mans Area': 'CY', 'Siachen Glacier': 'IN',
-        'Akrotiri Sovereign Base Area': 'GB', 'Bajo Nuevo Bank (Petrel Is.)': 'CO',
-        'Taiwan': 'TW', 'Scarborough Reef': 'PH', 'Northern Cyprus': 'CY',
-        'US Naval Base Guantanamo Bay': 'CU', 'Somaliland': 'SO',
-        'Québec, Hydro-Québec distribution network': 'CA', 'Namibia': 'NA'
-    }
-
-    ecoinvent_locations_df['simplified_ISO2'] = ecoinvent_locations_df.apply(
-        lambda row: manual_overrides.get(row['Name'], row['simplified_ISO2']),
-        axis=1
-    )
-
-    ecoinvent_locations_df.loc[
-        ecoinvent_locations_df["Name"] == "Namibia", "Shortname"
-    ] = "NA"
 
     # Get PSILCA countries
     psilca_iso2_set = set(psilca_sector_dict.keys())
 
     # Build region map for multi-country regions
     region_map = {
-        idx: set(code.strip() for code in str(row['simplified_ISO2']).split(';'))
+        idx: {code.strip() for code in str(row["simplified_ISO2"]).split(";")}
         for idx, row in ecoinvent_locations_df.iterrows()
-        if row['simplified_ISO2'] and ';' in str(row['simplified_ISO2'])
+        if row["simplified_ISO2"] and ";" in str(row["simplified_ISO2"])
     }
 
     def map_to_psilca(row):
-        iso_string = row['simplified_ISO2']
+        info: str | None
+        iso_string = row["simplified_ISO2"]
         if not iso_string or pd.isna(iso_string):
             return None, None
 
-        iso_list = [code.strip() for code in iso_string.split(';') if code.strip()]
+        iso_list = [code.strip() for code in iso_string.split(";") if code.strip()]
         iso_set = set(iso_list)
 
         # Case: single country
@@ -145,20 +143,16 @@ def map_ecoinvent_locations(
                 return iso2, None
 
             # Find smallest region containing this country + at least one PSILCA country
-            candidates = [
-                (idx, region_map[idx])
-                for idx in region_map
-                if iso2 in region_map[idx]
-            ]
+            candidates = [(idx, region_map[idx]) for idx in region_map if iso2 in region_map[idx]]
             candidates.sort(key=lambda x: len(x[1]))
 
             for idx, region in candidates:
-                psilca_countries = [code for code in region if code in psilca_iso2_set]
+                psilca_countries = sorted(code for code in region if code in psilca_iso2_set)
                 if psilca_countries:
-                    removed = [code for code in region if code not in psilca_iso2_set]
-                    region_name = ecoinvent_locations_df.loc[idx, 'Shortname']
+                    removed = sorted(code for code in region if code not in psilca_iso2_set)
+                    region_name = ecoinvent_locations_df.loc[idx, "Shortname"]
                     info = f"Used region: {region_name}, removed: {', '.join(removed)}"
-                    return '; '.join(psilca_countries), info
+                    return "; ".join(psilca_countries), info
 
             return None, f"No PSILCA region found for {iso2}"
 
@@ -168,655 +162,679 @@ def map_ecoinvent_locations(
             if filtered:
                 removed = [code for code in iso_list if code not in psilca_iso2_set]
                 info = f"Removed: {', '.join(removed)}" if removed else None
-                return '; '.join(filtered), info
+                return "; ".join(filtered), info
             else:
                 candidates = [
                     (idx, region_map[idx])
                     for idx in region_map
-                    if iso_set & region_map[idx] and any(code in psilca_iso2_set for code in region_map[idx])
+                    if iso_set & region_map[idx]
+                    and any(code in psilca_iso2_set for code in region_map[idx])
                 ]
                 candidates.sort(key=lambda x: len(x[1]))
 
                 for idx, region in candidates:
-                    psilca_countries = [code for code in region if code in psilca_iso2_set]
+                    psilca_countries = sorted(code for code in region if code in psilca_iso2_set)
                     if psilca_countries:
-                        removed = [code for code in region if code not in psilca_iso2_set]
-                        region_name = ecoinvent_locations_df.loc[idx, 'Shortname']
-                        info = f"Used overlapping region: {region_name}, removed: {', '.join(removed)}"
-                        return '; '.join(psilca_countries), info
+                        removed = sorted(code for code in region if code not in psilca_iso2_set)
+                        region_name = ecoinvent_locations_df.loc[idx, "Shortname"]
+                        info = (
+                            f"Used overlapping region: {region_name}, removed: {', '.join(removed)}"
+                        )
+                        return "; ".join(psilca_countries), info
 
                 return None, f"No overlapping PSILCA region found for region: {iso_string}"
 
-    ecoinvent_locations_df[['PSILCA_mapping', 'PSILCA_mapping_info']] = \
-        ecoinvent_locations_df.apply(map_to_psilca, axis=1, result_type='expand')
+    ecoinvent_locations_df[["PSILCA_mapping", "PSILCA_mapping_info"]] = (
+        ecoinvent_locations_df.apply(map_to_psilca, axis=1, result_type="expand")
+    )
 
     return ecoinvent_locations_df
 
 
-def fetch_ecoinvent_activities_from_ecospold_files(
-    folder_path: str,
+# ---------------------------------------------------------------------------
+# Location concordance: detect unmapped locations, template write/merge/load
+# ---------------------------------------------------------------------------
+
+
+def collect_database_locations(technosphere: str) -> set[str]:
+    """Collect all unique location codes from a Brightway database.
+
+    Lightweight metadata-only scan (no exchange traversal).
+
+    Args:
+        technosphere: Name of the Brightway technosphere database.
+
+    Returns:
+        Non-empty location codes used by its activities.
+    """
+    from bw2data import Database as BWDatabase
+
+    locations: set[str] = set()
+    for act in BWDatabase(technosphere):
+        loc = act.get("location")
+        if loc:
+            locations.add(str(loc).strip())
+    return locations
+
+
+def detect_unmapped_locations(
+    db_locations: set[str],
+    mapping_df: pd.DataFrame,
+) -> list[str]:
+    """Return location codes present in the database but absent from the mapping."""
+    usable = mapping_df["PSILCA_mapping"].fillna("").astype(str).str.strip().ne("")
+    known = set(mapping_df.loc[usable, "Shortname"].dropna().astype(str).str.strip())
+    known.update({"RoW", "RoE"})
+    return sorted(db_locations - known)
+
+
+def write_or_merge_location_concordance(
+    concordance_path: str,
+    unmapped: list[str],
+    database_name: str,
+) -> tuple[int, int, int]:
+    """Write a location concordance template or merge new unmapped locations into an existing one.
+
+    If the file does not exist, creates it with all locations from *unmapped*.
+    If it exists, loads it, keeps all existing entries (preserving user-filled
+    countries), and appends any new unmapped locations not yet in the file.
+
+    Args:
+        concordance_path: JSON template to create or update.
+        unmapped: Location codes requiring a country mapping in the current run.
+        database_name: Database label recorded in template metadata.
+
+    Returns:
+        (n_loaded, n_new, n_still_missing): count of entries with valid countries,
+        count of newly added template entries, count of entries still missing.
+    """
+    existing: list[dict[str, Any]] = []
+    metadata: dict[str, Any] = {}
+
+    if os.path.exists(concordance_path):
+        with open(concordance_path, encoding="utf-8") as f:
+            data = json.load(f)
+        existing = data.get("locations", [])
+        metadata = data.get("metadata", {})
+
+    # Index existing entries by location_code for dedup
+    existing_keys: dict[str, int] = {}
+    required_codes = {str(code).strip() for code in unmapped}
+    for i, entry in enumerate(existing):
+        code = str(entry.get("location_code", "")).strip()
+        if code:
+            existing_keys[code] = i
+            entry["required"] = code in required_codes
+
+    # Merge new unmapped locations
+    n_new = 0
+    for code in unmapped:
+        if code in existing_keys:
+            continue
+        existing.append(
+            {
+                "location_code": code,
+                "countries": None,
+                "comment": None,
+                "required": True,
+            }
+        )
+        existing_keys[code] = len(existing) - 1
+        n_new += 1
+
+    # Count loaded vs still missing
+    n_loaded = 0
+    n_still_missing = 0
+    for entry in existing:
+        if not entry.get("required", False):
+            continue
+        countries = entry.get("countries")
+        if isinstance(countries, str) and countries.strip():
+            n_loaded += 1
+        else:
+            n_still_missing += 1
+
+    # Update metadata
+    metadata.update(
+        {
+            "database": database_name,
+            "note": (
+                "Fill in ISO2 country codes for each unmapped location "
+                "(semicolon-separated). Provide the FULL list of constituent "
+                "countries — SENSE will automatically filter to PSILCA-available "
+                "countries. Leave null to halt the pipeline."
+            ),
+            "example": {
+                "location_code": "EXAMPLE_REGION",
+                "countries": "DE; FR; IT; ES; NL; BE; AT; PT",
+                "comment": "Example: list all countries in the region, SENSE filters to PSILCA",
+            },
+        }
+    )
+
+    write_json_atomic(Path(concordance_path), {"metadata": metadata, "locations": existing})
+
+    return n_loaded, n_new, n_still_missing
+
+
+def load_location_concordance(concordance_path: str) -> dict[str, str]:
+    """Load filled location concordance entries from a JSON file.
+
+    Args:
+        concordance_path: Concordance JSON previously written by SENSE.
+
+    Returns:
+        Dict mapping location_code -> semicolon-separated ISO2 countries string.
+        Only entries where countries is non-null and non-empty are returned.
+    """
+    if not concordance_path or not os.path.exists(concordance_path):
+        return {}
+
+    with open(concordance_path, encoding="utf-8") as f:
+        data = json.load(f)
+
+    out: dict[str, str] = {}
+    for entry in data.get("locations", []):
+        code = str(entry.get("location_code", "")).strip()
+        countries = entry.get("countries")
+        if code and isinstance(countries, str) and countries.strip():
+            out[code] = countries.strip()
+    return out
+
+
+def fetch_ecoinvent_activities(
     mapping_df: pd.DataFrame,
     output_path: str,
     technosphere: str,
-    background_databases: Any,
-    foreground: bool,
-    missing_price_report_path: Optional[str] = None,
-    exclude_terms: Optional[Sequence[str]] = None,
-    exclude_terms_starting_with: Optional[Sequence[str]] = None,
+    exclude_terms: Sequence[str] | None = None,
+    exclude_terms_starting_with: Sequence[str] | None = None,
     price_floor_percentile: float = 20.0,
+    *,
+    exclude_exact: Sequence[str] | None = None,
+    zero_price_policy: str = "treatment_working_hours",
+    treatment_working_hours_percentile: float = 20.0,
+    auto_seed_prices_path: str | None = None,
+    database_label: str | None = None,
+    price_currency: str = "EUR",
+    price_year: int = 2005,
+    price_source_database: str | None = None,
+    activities: Sequence[Any] | None = None,
+    exclude_empty_inventories: bool = True,
+    empty_keys: set[tuple[str, str]] | None = None,
 ) -> pd.DataFrame:
     """
-    Build a positive-price activity table for a Brightway2 database.
-    
-    Estimates missing prices from EcoSpold files and maps activities to PSILCA regions.
-    
-    Pre-check order (foreground mode):
-      0) Explicit price? If activity has price>0 → use and stop.
-      1) In a loop (cycle)? → flag `foreground_cycle`, skip pricing this node.
-      2) Has technosphere inputs? If none → flag `foreground_no_inputs`, skip.
-      3) Has a path to any background DB? If not → flag `no_path_to_background`, skip.
+    Build an activity table with explicit monetary, zero, and treatment routes.
 
-    Pricing rules:
-      - Inputs that are no-input activities are ignored (0 contribution).
-      - Inputs that are in cycles or have no path to background are blocking.
-      - Gross-only pricing: ignore negative-amount BG exchanges (credits).
-      - Recursively accumulate priced background leaves; require total > 0.
-    
+    Prices are seeded from reference-exchange properties retained by the
+    Brightway ecoinvent importer, activity-level values, and the managed seed
+    template, then propagated through the technosphere input graph.
+
     Args:
-        folder_path: Path to folder containing EcoSpold02 (.spold) files
         mapping_df: DataFrame mapping ISO2 codes to PSILCA regions
         output_path: Path for the resulting JSON output
         technosphere: Name of the technosphere database to analyze
-        background_databases: Background database name(s) for price estimation
-        foreground: If True, treat technosphere as a foreground database
-        missing_price_report_path: Optional path for price report
         exclude_terms: Terms that exclude activities from output if found anywhere
         exclude_terms_starting_with: Terms that exclude if found as prefix
-        price_floor_percentile: Percentile for unit-level price floor (0 to disable)
-        
+        price_floor_percentile: Percentile used only by the legacy price-floor policy.
+        zero_price_policy: Treatment hours, legacy price replacement, or zero direct scores.
+        treatment_working_hours_percentile: Zero disables unpriced treatment inventories.
+        exclude_exact: Exact activity names to exclude from final output.
+        auto_seed_prices_path: Managed seed template written and read by SENSE.
+        database_label: Human-readable database name stored in seed metadata.
+        price_currency: Currency expected for manual seed prices.
+        price_year: Reference year expected for manual seed prices.
+        price_source_database: Ecoinvent Brightway database containing source
+            prices. Defaults to ``technosphere``.
+        activities: Optional preloaded Brightway activity snapshot.
+        exclude_empty_inventories: Exclude empty physical inventories in any
+            database from direct social mapping and treatment-hour references.
+        empty_keys: Optional precomputed empty-inventory exclusion set.
+
     Returns:
         DataFrame with activity data including prices
-        
+
     Note:
         Requires Brightway2 (`bw2data`) to be installed and a project to be active.
     """
     from bw2data import Database
+    from tqdm import tqdm
 
-    # ---------------------------------------------------------------------------------
-    # Detailed function overview:
-    # Builds a per-activity positive-price table for a Brightway2 technosphere
-    # database. Extraction strategy:
-    #  - Load explicit prices from activities (foreground explicit prices)
-    #  - Build `flat_price_lookup` from EcoSpold .spold files (background prices)
-    #  - For foreground activities, either compute a one-shot BG-only sum when
-    #    all inputs are background, or resolve mixed FG/BG activities by
-    #    iterative recursion using already-resolved FG children.
-    #
-    # The function records diagnostics in `not_found_records` and writes the
-    # final per-ISO2 JSON to `output_path`.
-    # ---------------------------------------------------------------------------------
-
-    # Default exclude terms
-    if exclude_terms is None:
-        exclude_terms = []
-    if exclude_terms_starting_with is None:
-        exclude_terms_starting_with = []
-    
-    # EcoSpold v2 namespace
-    ns = {'eco': 'http://www.EcoInvent.org/EcoSpold02'}
-
-    def clean(text: str) -> str:
-        return re.sub(r'\s+', ' ', (text or "").replace('\xa0', ' ').strip().lower())
-
-    def normalize_name(name: str) -> str:
-        return re.sub(r'\s+', ' ', (name or "").lower().strip().replace(',', '').replace('-', ''))
-
-    # Pre-lowercase for efficient checks
-    exclude_prefixes_l = tuple(t.lower() for t in exclude_terms_starting_with)
-    exclude_substrings_l = tuple(t.lower() for t in exclude_terms)
-
-    def is_skipped_name(name: str) -> bool:
-        s = (name or "").lower()
-        for pref in exclude_prefixes_l:
-            if s.startswith(pref):
-                return True
-        for term in exclude_substrings_l:
-            if term in s:
-                return True
-        return False
-
-    # Normalize background DBs to a set
-    if isinstance(background_databases, (list, tuple, set)):
-        bg_dbs: Set[str] = set(background_databases)
-    else:
-        bg_dbs = {str(background_databases)}
+    if zero_price_policy not in {"treatment_working_hours", "legacy_price_floor", "zero"}:
+        raise ValueError("Unknown zero_price_policy")
+    if not math.isfinite(treatment_working_hours_percentile) or not (
+        0 <= treatment_working_hours_percentile <= 100
+    ):
+        raise ValueError("Treatment percentile must be between 0 and 100")
+    exclude_terms = exclude_terms or []
+    exclude_terms_starting_with = exclude_terms_starting_with or []
+    pricing_audit: list[dict[str, Any]] = []
 
     # PSILCA mappings
-    iso2_to_psilca: Dict[str, str] = mapping_df.set_index('Shortname')['PSILCA_mapping'].to_dict()
-    base_psilca_sets: Dict[str, Set[str]] = {
-        "RoW": set(iso2_to_psilca.get("GLO", "").split("; ")),
-        "RoE": set(iso2_to_psilca.get("RER", "").split("; ")),
+    iso2_to_psilca: dict[str, str] = mapping_df.set_index("Shortname")["PSILCA_mapping"].to_dict()
+    # Geographic membership is distinct from the countries supplying a social
+    # proxy. A territory may use global PSILCA data without covering the globe.
+    iso2_to_geography = (
+        mapping_df.set_index("Shortname")["simplified_ISO2"].to_dict()
+        if "simplified_ISO2" in mapping_df
+        else {}
+    )
+    base_psilca_sets: dict[str, set[str]] = {
+        "RoW": {c.strip() for c in str(iso2_to_psilca.get("GLO") or "").split(";") if c.strip()},
+        "RoE": {c.strip() for c in str(iso2_to_psilca.get("RER") or "").split(";") if c.strip()},
     }
 
     # Load database
-    techno_db = Database(technosphere)
+    technosphere_activities = sorted(
+        activities if activities is not None else Database(technosphere),
+        key=lambda activity: (str(activity.key[0]), str(activity.key[1])),
+    )
+    from sense.eligibility import validate_activity_locations
 
-    activity_meta: Dict[str, Dict[str, Any]] = {}
-    estimated_prices: Dict[str, float] = {}
-    not_found_records: List[Dict[str, Any]] = []
-    
-    # Storage for foreground analysis
-    act_by_code: Dict[str, Any] = {}
-    inputs_by_code: Dict[str, List[Any]] = {}
-    codes_in_cycles: Set[str] = set()
-    scc_membership: Dict[str, List[str]] = {}
-    codes_with_no_inputs: Set[str] = set()
-    codes_no_path_to_bg: Set[str] = set()
+    validate_activity_locations(
+        technosphere_activities,
+        prefixes=exclude_terms_starting_with,
+        terms=exclude_terms,
+        exact=exclude_exact or (),
+    )
 
-    def _sb_tags(code: str, reason: str) -> Dict[str, Any]:
-        """Mark true source blockers."""
-        if not foreground:
-            return {"is_source_blocker": False, "reason_tag": "", "source_blocker_type": ""}
+    activity_meta: dict[str, dict[str, Any]] = {}
+    estimated_prices: dict[str, float | None] = {}
+    n_not_found: int = 0
 
-        ins = inputs_by_code.get(code, [])
-        has_fg = any(getattr(exc.input, 'database', None) == technosphere for exc in ins)
-        has_bg = any(getattr(exc.input, 'database', None) in bg_dbs for exc in ins)
+    source_database = price_source_database or technosphere
+    source_activities = (
+        technosphere_activities
+        if source_database == technosphere
+        else sorted(
+            Database(source_database),
+            key=lambda activity: (str(activity.key[0]), str(activity.key[1])),
+        )
+    )
+    price_catalog: BrightwayPriceCatalog = build_brightway_price_catalog(
+        source_activities,
+        source_database=source_database,
+        price_currency=price_currency,
+        price_year=price_year,
+        price_floor_percentile=(
+            price_floor_percentile if zero_price_policy == "legacy_price_floor" else 0.0
+        ),
+    )
+    logger.info(
+        "Loaded %d exact and %d product-level prices from Brightway database %r",
+        len(price_catalog.by_code),
+        len(price_catalog.by_product),
+        source_database,
+    )
 
-        if reason in ("foreground_no_inputs", "no_path_to_background", "foreground_cycle"):
-            return {"is_source_blocker": False, "reason_tag": "", "source_blocker_type": ""}
+    # Load the managed seed template before building the graph. This lets graph
+    # construction stop at already priced suppliers instead of recursively
+    # expanding their databases.
+    _price_currency = price_currency
+    _price_year = int(price_year)
+    _auto_seed_path = auto_seed_prices_path
+    auto_map = (
+        load_seed_template(
+            str(_auto_seed_path),
+            expected_currency=_price_currency,
+            expected_year=_price_year,
+        )
+        if _auto_seed_path and os.path.exists(_auto_seed_path)
+        else {}
+    )
 
-        if (reason in ("foreground_total_nonpositive", "foreground_zero_inputs_no_unit_p20", 
-                       "nonpositive_after_cleanup") and not has_fg and has_bg):
-            return {"is_source_blocker": True, "reason_tag": "source_blocker", 
-                    "source_blocker_type": "bg_only_root"}
+    resolved_prices: dict[tuple, float | None] = {}
+    price_sources: dict[tuple, str] = {}
 
-        if reason in ("foreground_unresolvable_inputs",) and not has_fg and has_bg:
-            return {"is_source_blocker": True, "reason_tag": "source_blocker", 
-                    "source_blocker_type": "bg_missing_price"}
-
-        return {"is_source_blocker": False, "reason_tag": "", "source_blocker_type": ""}
-
-    # Fast path for fully priced foreground
-    has_all_prices = foreground and all((act.get("price", 0) or 0) > 0 for act in techno_db)
-    
-    if has_all_prices:
-        for act in techno_db:
-            code = norm_code(act["code"])
-            estimated_prices[code] = float(act["price"])
-            activity_meta[code] = {
-                "name": act["name"],
-                "reference product": act["reference product"],
-                "unit": (act["unit"] or "").lower(),
-                "location": act["location"],
-            }
-        isic_lookup: Dict[Tuple[str, str], Set[str]] = {}
-    else:
-        # ------------------ Parse EcoSpold files (cached) ------------------
-        # Collect price observations from EcoSpold02 files. Results are stored
-        # in `product_price_map` which maps (unit, product) -> list(prices).
-        # If a `spold_cache.pkl` exists we load `product_price_map` and
-        # `isic_lookup` from the cache to avoid re-parsing thousands of files.
-        cache_file = os.path.join(folder_path, "spold_cache.pkl")
-        if os.path.exists(cache_file):
-            with open(cache_file, "rb") as f:
-                product_price_map, isic_lookup = pickle.load(f)
-        else:
-            product_price_map: Dict[Tuple[str, str], List[float]] = defaultdict(list)
-            isic_lookup: Dict[Tuple[str, str], Set[str]] = defaultdict(set)
-            spold_files = [os.path.join(folder_path, f) 
-                          for f in os.listdir(folder_path) if f.endswith(".spold")]
-
-            for path in tqdm(spold_files, desc="📄 Parsing .spold files"):
-                try:
-                    root = ET.parse(path).getroot()
-                    act_name = root.findtext('.//eco:activity/eco:activityName', 
-                                            default='', namespaces=ns).strip()
-
-                    ref = next(
-                        (ie for ie in root.findall(".//eco:intermediateExchange", ns)
-                         if (ie.findtext("eco:outputGroup", default='', namespaces=ns) or "").strip() == "0"),
-                        None
+    def resolve_price(activity: Any) -> float | None:
+        """Resolve once per activity: user seed, own price, exact source, product."""
+        key = tuple(activity.key)
+        if key in resolved_prices:
+            return resolved_prices[key]
+        product_key = prod_key(
+            str(activity.get("unit") or ""),
+            str(activity.get("reference product") or activity.get("name") or ""),
+        )
+        price = auto_map.get(product_key)
+        source = "user_seed" if price is not None else "unresolved"
+        if price is None:
+            raw_own_price = activity.get("price")
+            # Brightway can expose imported production properties directly on
+            # the activity as {amount, unit}, alongside numeric custom prices.
+            imported_property = isinstance(raw_own_price, dict)
+            if imported_property:
+                monetary_unit = str(raw_own_price.get("unit") or "").replace(" ", "").casefold()
+                if monetary_unit != f"{_price_currency}{_price_year}".casefold():
+                    raise ValueError(
+                        f"Activity {activity.key!r} has an incompatible activity price unit"
                     )
-                    if not ref:
-                        continue
-
-                    ref_name = (ref.findtext("eco:name", default='', namespaces=ns) or "").strip().lower()
-                    unit = (ref.findtext("eco:unitName", default='', namespaces=ns) or "").strip().lower()
-
-                    price = next(
-                        (float(p.attrib["amount"]) for p in ref.findall("eco:property", ns)
-                         if (p.findtext("eco:name", default='', namespaces=ns) or "").lower() == "price"
-                         and p.attrib.get("amount") is not None),
-                        None
+                raw_own_price = raw_own_price.get("amount")
+            try:
+                own_price = float(raw_own_price)
+            except (TypeError, ValueError) as error:
+                if activity.get("price") is not None:
+                    raise ValueError(
+                        f"Activity {activity.key!r} has a non-numeric activity price"
+                    ) from error
+                own_price = None
+            if own_price is not None:
+                if not math.isfinite(own_price) or own_price < 0:
+                    raise ValueError(f"Activity {activity.key!r} has an invalid activity price")
+                if (
+                    activity.get("sense_paired_price_basis") is None
+                    or activity.get("sense_paired_price_policy") == zero_price_policy
+                ):
+                    # The legacy catalog already replaces imported zeros.
+                    if not (
+                        imported_property
+                        and own_price == 0
+                        and zero_price_policy == "legacy_price_floor"
+                    ):
+                        price = own_price
+                        source = "activity_price"
+        if price is None:
+            # Source reference prices were already read, validated and floored
+            # when building the catalog; avoid a second exchange query per row.
+            code = norm_code(activity.get("code")) or str(activity.key[1])
+            exact = price_catalog.by_code.get(code)
+            if key[0] == source_database and exact is not None and exact[0] == product_key:
+                price = exact[1]
+                source = "source_reference_price"
+        if price is None:
+            reference_price = reference_price_property(activity)
+            if reference_price is not None:
+                expected = f"{_price_currency}{_price_year}"
+                if reference_price[1].replace(" ", "").casefold() != expected.casefold():
+                    raise ValueError(
+                        f"Activity {activity.key!r} uses price unit {reference_price[1]!r}; "
+                        f"expected {expected}"
                     )
-                    if ref_name and price is not None:
-                        product_price_map[(unit, ref_name)].append(price)
+                if reference_price[0] > 0 or zero_price_policy != "legacy_price_floor":
+                    price = reference_price[0]
+                    source = "reference_price"
+        if price is None:
+            code = norm_code(activity.get("code")) or str(activity.key[1])
+            exact = price_catalog.by_code.get(code)
+            if exact is not None and exact[0] == product_key:
+                price = exact[1]
+                source = "exact_background_price"
+        if price is None:
+            price = price_catalog.by_product.get(product_key)
+            if price is not None:
+                source = "product_background_price"
+        price_sources[key] = source
+        resolved_prices[key] = price
+        return price
 
-                    isic = next(
-                        (c.findtext("eco:classificationValue", default='', namespaces=ns).strip()
-                         for c in root.findall(".//eco:classification", ns)
-                         if "isic" in (c.findtext("eco:classificationSystem", default='', 
-                                                  namespaces=ns) or "").lower()),
-                        None
-                    )
-                    if ref_name and isic:
-                        isic_lookup[(clean(act_name), clean(ref_name))].add(isic)
-                except Exception:
-                    continue
+    # ------------------ Build metadata and resolve direct prices ------------------
+    unresolved_activities: list[Any] = []
+    empty_inventory = set()
+    if exclude_empty_inventories:
+        empty_inventory = (
+            empty_keys if empty_keys is not None else empty_inventory_keys(technosphere_activities)
+        )
+    exclusions = {
+        tuple(act.key): exclusion_reason(
+            act,
+            prefixes=exclude_terms_starting_with,
+            terms=exclude_terms,
+            exact=exclude_exact or [],
+            empty_inventory=tuple(act.key) in empty_inventory,
+        )
+        for act in technosphere_activities
+    }
+    # Use the writer's reference validation, reading SQLite in batches rather
+    # than issuing one production query for every regionalized activity.
+    reference_amounts = reference_production_amounts(
+        {
+            tuple(act.key): act
+            for act in technosphere_activities
+            if exclusions[tuple(act.key)] is None
+        },
+        preserve_sign=True,
+    )
+    for act in tqdm(
+        technosphere_activities,
+        desc=f"Preparing activities: {technosphere}",
+        unit="activity",
+        dynamic_ncols=True,
+    ):
+        reason = exclusions[tuple(act.key)]
+        if reason:
+            pricing_audit.append(
+                {
+                    "code": str(act["code"]),
+                    "name": act.get("name"),
+                    "status": "excluded",
+                    "reason": reason,
+                }
+            )
+            continue
+        code = norm_code(act["code"]) or str(act.key[1])
 
-            with open(cache_file, "wb") as f:
-                pickle.dump((product_price_map, isic_lookup), f)
+        # Extract ISIC from Brightway classifications (authoritative source)
+        isic_bw = None
+        for cls in act.get("classifications") or []:
+            if isinstance(cls, (list, tuple)) and len(cls) >= 2 and "ISIC" in str(cls[0]):
+                isic_bw = str(cls[1])
+                break
 
-        # ------------------ Build cleaned lookup (unit-level price floor) ------------------
-        # Convert raw price lists into an average price per (unit, product).
-        # Optionally compute a per-unit percentile floor (`unit_price_floor`) to
-        # replace zero observations with a conservative estimate. The result
-        # `flat_price_lookup` maps normalized product names -> average price.
-        avg_prices: Dict[str, Dict[str, float]] = defaultdict(dict)
-        for (unit, product), prices in product_price_map.items():
-            valid = [p for p in prices if p is not None]
-            if valid:
-                avg_prices[unit][product] = sum(valid) / len(valid)
-
-        unit_price_floor: Dict[str, float] = {}
-        q = None
-        if price_floor_percentile is not None and price_floor_percentile > 0:
-            q = float(price_floor_percentile) / 100.0
-
-        for unit, products in avg_prices.items():
-            vals = [v for v in products.values() if v is not None and v > 0]
-            if q is not None and vals:
-                unit_price_floor[unit] = float(pd.Series(vals).quantile(q))
-            else:
-                unit_price_floor[unit] = float("nan")
-
-        zero_no_unitp20_products: Set[str] = set()
-        price_lookup_raw: Dict[str, Dict[str, float]] = defaultdict(dict)
-        
-        for (unit, product), prices in product_price_map.items():
-            cleaned: List[float] = []
-            saw_zero_no_p20 = False
-            for p in prices:
-                if p is None:
-                    continue
-                if p == 0:
-                    ufloor = unit_price_floor.get(unit, None)
-                    if ufloor is not None and not pd.isna(ufloor) and ufloor > 0:
-                        cleaned.append(float(ufloor))
-                    else:
-                        cleaned.append(0.0)
-                        saw_zero_no_p20 = True
-                else:
-                    cleaned.append(float(p))
-            if cleaned:
-                avg = sum(cleaned) / len(cleaned)
-                price_lookup_raw[unit][product] = avg
-                if saw_zero_no_p20 and avg == 0.0:
-                    zero_no_unitp20_products.add(normalize_name(product))
-
-        flat_price_lookup: Dict[str, float] = {
-            normalize_name(product): price
-            for unit_dict in price_lookup_raw.values()
-            for product, price in unit_dict.items()
+        activity_meta[code] = {
+            "name": act["name"],
+            "reference product": act["reference product"],
+            "unit": (act["unit"] or "").lower(),
+            "location": act["location"],
+            "isic": isic_bw,
         }
 
-        # ------------------ Foreground pre-checks ------------------
-        # When `foreground` is True we build per-code structures, detect
-        # strongly-connected components (cycles), find activities without
-        # technosphere inputs, and compute reachability to background DBs.
-        # These pre-checks allow the pricing stages to skip or flag
-        # problematic nodes early and to support the recursive resolver.
-        fg_adj: Dict[str, Set[str]] = defaultdict(set)
-        
-        if foreground:
-            for act in techno_db:
-                c = norm_code(act['code'])
-                act_by_code[c] = act
-                ins = list(act.technosphere())
-                inputs_by_code[c] = ins
-                for exc in ins:
-                    if exc.input['database'] == technosphere:
-                        fg_adj[c].add(norm_code(exc.input['code']))
+        direct_price = resolve_price(act)
+        reference_amount = reference_amounts[tuple(act.key)]
+        treatment = is_treatment(act, reference_amount)
+        if (
+            treatment
+            and price_sources[tuple(act.key)] == "product_background_price"
+            and zero_price_policy == "treatment_working_hours"
+        ):
+            # A generic product average is not a supplied treatment-service price.
+            direct_price = None
+            price_sources[tuple(act.key)] = "unresolved_treatment_price"
+        activity_meta[code]["reference amount"] = reference_amount
+        activity_meta[code]["is treatment"] = treatment
+        activity_meta[code]["price source"] = price_sources[tuple(act.key)]
+        needs_fallback = (
+            treatment
+            and (direct_price is None or direct_price == 0)
+            and zero_price_policy == "treatment_working_hours"
+        )
+        route = "monetary"
+        if needs_fallback:
+            route = "zero" if treatment_working_hours_percentile == 0 else "treatment_fallback"
+        activity_meta[code]["calculation route"] = route
+        if route in {"zero", "treatment_fallback"}:
+            # Disabled treatments retain zero/missing price provenance and never
+            # acquire an inferred price or enter the donor-reference calculation.
+            estimated_prices[code] = direct_price
+        elif direct_price is None:
+            unresolved_activities.append(act)
+        elif direct_price >= 0:
+            estimated_prices[code] = float(direct_price)
 
-            # Cycle detection via Tarjan SCC
-            index, stack, onstack = 0, [], set()
-            indices, lowlinks = {}, {}
-            sccs: List[List[str]] = []
+    # ------------------ Product-graph price inference ------------------
+    graph = None
+    product_prices: dict[int, float] = {}
+    if unresolved_activities:
+        logger.info(
+            "Running product-graph inference for %d/%d activities without a direct price...",
+            len(unresolved_activities),
+            len(activity_meta),
+        )
 
-            def _strongconnect(v: str):
-                nonlocal index
-                indices[v] = index
-                lowlinks[v] = index
-                index += 1
-                stack.append(v)
-                onstack.add(v)
-                for w in fg_adj.get(v, ()):
-                    if w not in indices:
-                        _strongconnect(w)
-                        lowlinks[v] = min(lowlinks[v], lowlinks[w])
-                    elif w in onstack:
-                        lowlinks[v] = min(lowlinks[v], indices[w])
-                if lowlinks[v] == indices[v]:
-                    comp = []
-                    while True:
-                        w = stack.pop()
-                        onstack.remove(w)
-                        comp.append(w)
-                        if w == v:
-                            break
-                    sccs.append(comp)
+        # Determine biosphere DB name — check for spatialized version first
+        from bw2data import databases as bw_databases
 
-            for v in act_by_code.keys():
-                if v not in indices:
-                    _strongconnect(v)
+        _bio_candidates = ["biosphere3_spatialized_flows", "biosphere3"]
+        _biosphere_db_name = "biosphere3"
+        for _bc in _bio_candidates:
+            if _bc in bw_databases:
+                _biosphere_db_name = _bc
+                break
 
-            for comp in sccs:
-                if len(comp) > 1:
-                    for c in comp:
-                        codes_in_cycles.add(c)
-                        scc_membership[c] = comp[:]
-                elif len(comp) == 1:
-                    c = comp[0]
-                    if c in fg_adj and c in fg_adj[c]:
-                        codes_in_cycles.add(c)
-                        scc_membership[c] = comp[:]
+        graph = build_product_graph(
+            target_database=technosphere,
+            biosphere_database=_biosphere_db_name,
+            activities=unresolved_activities,
+            should_expand_external=lambda activity: resolve_price(activity) is None,
+            resolve_price=resolve_price,
+            expected_price_unit=f"{_price_currency}{_price_year}",
+        )
 
-            codes_with_no_inputs = {c for c, ins in inputs_by_code.items() if len(ins) == 0}
+        initial_prices = graph.pid_activity_price_seed
+        initial_sources = dict.fromkeys(initial_prices, "resolved_activity_price")
 
-            # Background reachability
-            has_direct_bg = {
-                c: any(exc.input['database'] in bg_dbs for exc in ins)
-                for c, ins in inputs_by_code.items()
-            }
-            bg_reachable = dict(has_direct_bg)
-            changed = True
-            while changed:
-                changed = False
-                for c, ins in inputs_by_code.items():
-                    if bg_reachable.get(c, False):
-                        continue
-                    fg_children = [
-                        norm_code(exc.input['code'])
-                        for exc in ins if exc.input['database'] == technosphere
-                    ]
-                    if any(bg_reachable.get(ch, False) for ch in fg_children):
-                        bg_reachable[c] = True
-                        changed = True
+        logger.info(
+            "  Seeds: %d / %d products priced before inference",
+            len(initial_prices),
+            len(graph.id_to_product),
+        )
 
-            codes_no_path_to_bg = {
-                c for c in act_by_code.keys()
-                if not bg_reachable.get(c, False)
-            }
+        product_prices, _ = run_product_inference(
+            cache=graph,
+            initial_prices=initial_prices,
+            initial_sources=initial_sources,
+        )
 
-            # Pre-flag problematic activities
-            for c in codes_in_cycles:
-                a = act_by_code[c]
-                not_found_records.append({
-                    "code": c, "name": a["name"],
-                    "reference product": a["reference product"],
-                    "unit": (a["unit"] or "").lower(), "location": a["location"],
-                    "normalized_key": normalize_name(a["reference product"]),
-                    "reason": "foreground_cycle",
-                    "in_cycle": True,
-                    "cycle_members": "; ".join(scc_membership.get(c, [c])),
-                    **_sb_tags(c, "foreground_cycle"),
-                })
-            for c in codes_with_no_inputs:
-                a = act_by_code[c]
-                not_found_records.append({
-                    "code": c, "name": a["name"],
-                    "reference product": a["reference product"],
-                    "unit": (a["unit"] or "").lower(), "location": a["location"],
-                    "normalized_key": normalize_name(a["reference product"]),
-                    "reason": "foreground_no_inputs",
-                    **_sb_tags(c, "foreground_no_inputs"),
-                })
-            for c in codes_no_path_to_bg:
-                a = act_by_code[c]
-                not_found_records.append({
-                    "code": c, "name": a["name"],
-                    "reference product": a["reference product"],
-                    "unit": (a["unit"] or "").lower(), "location": a["location"],
-                    "normalized_key": normalize_name(a["reference product"]),
-                    "reason": "no_path_to_background",
-                    **_sb_tags(c, "no_path_to_background"),
-                })
+        for act in unresolved_activities:
+            code = norm_code(act.get("code")) or str(act.key[1])
+            activity_pid = graph.activity_to_id.get((technosphere, code))
+            if activity_pid is not None and activity_pid in product_prices:
+                price_val = product_prices[activity_pid]
+                if price_val >= 0:
+                    estimated_prices[code] = price_val
+                    activity_meta[code]["price source"] = "inferred_from_inputs"
+    else:
+        logger.info(
+            "Direct Brightway prices resolved all %d eligible activities; "
+            "product-graph inference is not needed.",
+            len(activity_meta),
+        )
 
-        # Initialize `unresolved`: activities that need iterative resolution
-        # (mixed foreground and background inputs).
-        unresolved: Dict[str, Any] = {}
+    n_not_found = len(activity_meta) - len(estimated_prices)
 
-        # ------------------ Step 4: Price estimation for each activity ------------------
-        # For each activity we try, in order: explicit price (FG only), direct
-        # BG lookup (BG mode), one-shot BG-only sum (FG node whose inputs are
-        # all BG), otherwise collect it into `unresolved` for recursive pass.
-        # The loop below records detailed diagnostics for any activity that
-        # cannot be priced immediately.
-        for act in tqdm(techno_db, desc="🔎 Estimating activity prices"):
-            code = norm_code(act['code'])
-            name = act['name']
-            ref_product = act['reference product']
-            ref_key = normalize_name(ref_product)
+    # Log seed worklist and write/merge auto seed template if there are unresolved products
+    n_unresolved = len(activity_meta) - len(estimated_prices)
+    seed_worklist = (
+        build_minimal_seed_worklist(cache=graph, priced=product_prices)
+        if n_unresolved > 0 and graph is not None
+        else pd.DataFrame()
+    )
+    if not seed_worklist.empty:
+        logger.info(
+            "  %d activities remain unpriced; the minimal seed worklist has %d products.",
+            n_unresolved,
+            len(seed_worklist),
+        )
 
-            activity_meta[code] = {
-                "name": name,
-                "reference product": ref_product,
-                "unit": (act['unit'] or "").lower(),
-                "location": act['location'],
-            }
+    # Keep an existing template synchronized even when every product now
+    # resolves, so stale null entries cannot block a later pipeline stage.
+    if _auto_seed_path and (not seed_worklist.empty or os.path.exists(_auto_seed_path)):
+        _db_name = database_label or technosphere
+        n_loaded, n_new, n_still_missing = write_or_merge_seed_template(
+            seed_json_path=str(_auto_seed_path),
+            worklist_df=seed_worklist,
+            database_name=_db_name,
+            price_currency=_price_currency,
+            price_year=_price_year,
+        )
+        if n_new > 0:
+            logger.info(
+                "  📝 Wrote %d new entries to seed price template: %s",
+                n_new,
+                _auto_seed_path,
+            )
+        if n_loaded > 0:
+            logger.info(
+                "  ✅ %d seed prices loaded from template.",
+                n_loaded,
+            )
+        if n_still_missing > 0:
+            raise SenseInputRequiredError(
+                f"{n_still_missing} seed prices require user input",
+                Path(_auto_seed_path),
+            )
 
-            # Explicit price (foreground only)
-            price_field = act.get("price", 0)
-            if foreground and price_field and price_field > 0:
-                estimated_prices[code] = float(price_field)
-                continue
-
-            # Background mode: direct lookup
-            if not foreground:
-                if ref_key in flat_price_lookup:
-                    ref_price = flat_price_lookup[ref_key]
-                    if ref_price is not None and ref_price > 0:
-                        estimated_prices[code] = float(ref_price)
-                    else:
-                        not_found_records.append({
-                            "code": code, "name": name, "reference product": ref_product,
-                            "unit": (act['unit'] or "").lower(), "location": act['location'],
-                            "normalized_key": ref_key,
-                            "reason": ("zero_price_no_unit_p20" if ref_key in zero_no_unitp20_products
-                                      else "background_no_spold_price"),
-                        })
-                else:
-                    not_found_records.append({
-                        "code": code, "name": name, "reference product": ref_product,
-                        "unit": (act['unit'] or "").lower(), "location": act['location'],
-                        "normalized_key": ref_key, "reason": "background_no_spold_price",
-                    })
-                continue
-
-            # Foreground pre-check gatekeeping
-            if code in codes_in_cycles or code in codes_with_no_inputs or code in codes_no_path_to_bg:
-                continue
-
-            inputs = inputs_by_code.get(code, [])
-            # If all inputs are background/biosphere3 → one-shot sum
-            if inputs and all(exc.input['database'] in bg_dbs or exc.input['database'] == "biosphere3" for exc in inputs):
-                total, resolvable = 0.0, True
-                zero_nop20_inputs: List[str] = []
-                for exc in inputs:
-                    if exc.input['database'] not in bg_dbs:
-                        continue
-                    amt = float(exc['amount'])
-                    if amt <= 0:
-                        continue  # ignore BG credits
-                    inp_key = normalize_name(exc.input['reference product'])
-                    inp_price = flat_price_lookup.get(inp_key, None)
-                    if inp_price is None:
-                        resolvable = False
-                        break
-                    if inp_price == 0.0 and inp_key in zero_no_unitp20_products:
-                        zero_nop20_inputs.append(inp_key)
-                    total += amt * float(inp_price)
-                if resolvable:
-                    if total > 0:
-                        estimated_prices[code] = total
-                    else:
-                        reason = ("foreground_zero_inputs_no_unit_p20" if zero_nop20_inputs
-                                  else "foreground_total_nonpositive")
-                        not_found_records.append({
-                            "code": code, "name": name, "reference product": ref_product,
-                            "unit": (act['unit'] or "").lower(), "location": act['location'],
-                            "normalized_key": ref_key,
-                            "reason": reason,
-                            **_sb_tags(code, reason),
-                        })
-                else:
-                    not_found_records.append({
-                        "code": code, "name": name, "reference product": ref_product,
-                        "unit": (act['unit'] or "").lower(), "location": act['location'],
-                        "normalized_key": ref_key, "reason": "foreground_unresolvable_inputs",
-                        **_sb_tags(code, "foreground_unresolvable_inputs"),
-                    })
-                    unresolved[code] = inputs
-            else:
-                # Mixed foreground inputs → postpone to recursive pass
-                unresolved[code] = inputs
-
-        # ------------------ Step 5: Recursive resolution for foreground ------------------
-        # Iteratively resolve activities collected in `unresolved` by
-        # substituting prices of already-resolved FG children and adding BG
-        # contributions. Continue until no new activities are resolved in an
-        # iteration. Activities that remain unresolved are recorded in the
-        # diagnostics with an appropriate reason (cycle, no-path-to-bg, or
-        # recursive_unresolved).
-        if foreground:
-            while True:
-                newly_resolved: Dict[str, float] = {}
-
-                for code, inputs in list(unresolved.items()):
-                    meta = activity_meta[code]
-                    total, resolvable = 0.0, True
-                    zero_nop20_inputs: List[str] = []
-
-                    for exc in inputs:
-                        if exc.input['database'] == technosphere:
-                            child_code = norm_code(exc.input['code'])
-
-                            # Ignore: no-input children
-                            if child_code in codes_with_no_inputs:
-                                continue
-                            # Blockers: cycles or no-path-to-bg children
-                            if child_code in codes_in_cycles or child_code in codes_no_path_to_bg:
-                                resolvable = False
-                                break
-
-                            inp_price = estimated_prices.get(child_code)
-                            if inp_price is None:
-                                resolvable = False
-                                break
-                            amt = float(exc['amount'])
-                            if amt <= 0:
-                                continue
-                            total += amt * float(inp_price)
-
-                        elif exc.input['database'] in bg_dbs:
-                            amt = float(exc['amount'])
-                            if amt <= 0:
-                                continue  # ignore BG credits
-                            inp_key = normalize_name(exc.input['reference product'])
-                            inp_price = flat_price_lookup.get(inp_key)
-                            if inp_price is None:
-                                resolvable = False
-                                break
-                            if inp_price == 0.0 and inp_key in zero_no_unitp20_products:
-                                zero_nop20_inputs.append(inp_key)
-                            total += amt * float(inp_price)
-
-                        else:
-                            # biosphere3 or others → ignore
-                            continue
-
-                    if resolvable and total > 0:
-                        newly_resolved[code] = total
-                    elif resolvable:
-                        reason = ("foreground_zero_inputs_no_unit_p20" if zero_nop20_inputs
-                                  else "foreground_total_nonpositive")
-                        not_found_records.append({
-                            "code": code, "name": meta["name"],
-                            "reference product": meta["reference product"],
-                            "unit": meta["unit"], "location": meta["location"],
-                            "normalized_key": normalize_name(meta["reference product"]),
-                            "reason": reason,
-                            **_sb_tags(code, reason),
-                        })
-                        unresolved.pop(code, None)
-                    # else: keep unresolved (might resolve after others)
-
-                if not newly_resolved:
-                    break
-
-                estimated_prices.update(newly_resolved)
-                unresolved = {k: v for k, v in unresolved.items() if k not in newly_resolved}
-
-            # Anything still unresolved → cycle, no-path-to-bg, or stuck
-            for code in list(unresolved.keys()):
-                meta = activity_meta[code]
-                reason = ("foreground_cycle" if code in codes_in_cycles else
-                          "no_path_to_background" if code in codes_no_path_to_bg else
-                          "foreground_recursive_unresolved")
-                not_found_records.append({
-                    "code": code, "name": meta["name"],
-                    "reference product": meta["reference product"],
-                    "unit": meta["unit"], "location": meta["location"],
-                    "normalized_key": normalize_name(meta["reference product"]),
-                    "reason": reason,
-                    "in_cycle": code in codes_in_cycles,
-                    "cycle_members": "; ".join(scc_membership.get(code, [])) if code in codes_in_cycles else None,
-                    **_sb_tags(code, reason),
-                })
-
-        # ------------------ Strict guard: move any nonpositive into report ------------------
-        # Any activity that ended up with a nonpositive price (None or <= 0)
-        # is treated as unpriced for the final output and moved to the
-        # diagnostics `not_found_records` with reason `nonpositive_after_cleanup`.
-        for code, val in list(estimated_prices.items()):
-            if val is None or val <= 0:
-                meta = activity_meta[code]
-                not_found_records.append({
-                    "code": code, "name": meta["name"],
-                    "reference product": meta["reference product"],
-                    "unit": meta["unit"], "location": meta["location"],
-                    "normalized_key": normalize_name(meta["reference product"]),
-                    "reason": "nonpositive_after_cleanup",
-                    **_sb_tags(code, "nonpositive_after_cleanup"),
-                })
-                estimated_prices.pop(code, None)
-
-    # Build final DataFrame
-    rows: List[Dict[str, Any]] = []
+    rows: list[dict[str, Any]] = []
     for code, meta in activity_meta.items():
         price = estimated_prices.get(code)
-        if price is not None and price > 0:
-            rows.append({
+        route = meta["calculation route"]
+        if route not in {"zero", "treatment_fallback"}:
+            if price is None:
+                pricing_audit.append({"code": code, "name": meta["name"], "status": "unresolved"})
+                continue
+            route = "monetary" if price > 0 else "zero"
+        pricing_audit.append(
+            {
+                "code": code,
+                "name": meta["name"],
+                "status": route,
+                "price": price,
+                "price_source": meta["price source"],
+                "reference_amount": meta["reference amount"],
+                "treatment_fallback_disabled": (
+                    meta["is treatment"]
+                    and route == "zero"
+                    and zero_price_policy == "treatment_working_hours"
+                    and treatment_working_hours_percentile == 0
+                ),
+            }
+        )
+        rows.append(
+            {
                 "ISO2": meta["location"],
                 "name": meta["name"],
                 "reference product": meta["reference product"],
                 "unit": meta["unit"],
-                "code": norm_code(code),
-                "ISIC rev.4 ecoinvent": (
-                    next(iter(isic_lookup.get((clean(meta["name"]), 
-                         clean(meta["reference product"])), set())), None)
-                    if not foreground else None
-                ),
-                "price": float(price),
-            })
-    df = pd.DataFrame(rows)
+                "code": code,
+                "ISIC rev.4 ecoinvent": meta.get("isic"),
+                "price": price,
+                "price source": meta["price source"],
+                "reference amount": meta["reference amount"],
+                "is treatment": meta["is treatment"],
+                "calculation route": route,
+            }
+        )
+    df = pd.DataFrame(
+        rows,
+        columns=[
+            "ISO2",
+            "name",
+            "reference product",
+            "unit",
+            "code",
+            "ISIC rev.4 ecoinvent",
+            "price",
+            "price source",
+            "reference amount",
+            "is treatment",
+            "calculation route",
+        ],
+    )
+    if df.empty and n_not_found:
+        raise ValueError(f"No resolved activities remain in {technosphere!r}")
+    write_json_atomic(
+        Path(output_path).with_suffix(".pricing.json"),
+        {
+            "schema": 1,
+            "policy": zero_price_policy,
+            "activities": pricing_audit,
+        },
+    )
 
-    # Apply exclusions
+    # Normalize output types. Name exclusions were applied before graph-root
+    # selection; excluded activities can still be traversed as dependencies.
     if not df.empty:
         df["name"] = df["name"].astype(str)
-        df = df[~df["name"].apply(is_skipped_name)].copy()
-        df["code"] = df["code"].apply(norm_code).astype(str)
+        df["code"] = df["code"].astype(str)
         df["price"] = pd.to_numeric(df["price"], errors="coerce")
+        df = df.sort_values(["ISO2", "code"], kind="stable").reset_index(drop=True)
 
     # Map to PSILCA & save JSON
     if not df.empty:
@@ -830,7 +848,7 @@ def fetch_ecoinvent_activities_from_ecospold_files(
     else:
         key_iso2_map = {}
 
-    final_output: List[Dict[str, Any]] = []
+    final_output: list[dict[str, Any]] = []
     for iso2, group in df.groupby("ISO2"):
         if iso2 in base_psilca_sets:
             base = base_psilca_sets[iso2]
@@ -840,7 +858,26 @@ def fetch_ecoinvent_activities_from_ecospold_files(
                 key = (row["name"], row["reference product"])
                 all_iso2s = key_iso2_map.get(key, set())
                 others = all_iso2s - {iso2}
-                psilca = "; ".join(sorted(base - others))
+                excluded_countries: set[str] = set()
+                for other in others:
+                    # Residual labels have activity-dependent membership, not a
+                    # fixed concordance entry. Preserve their existing handling;
+                    # this correction concerns ordinary geographic exclusions.
+                    if other in base_psilca_sets:
+                        continue
+                    geography = iso2_to_geography.get(other)
+                    if not isinstance(geography, str) or not geography.strip():
+                        raise ValueError(
+                            f"Location {other!r} has no actual country membership "
+                            f"(simplified_ISO2) for {iso2} exclusions; "
+                            "PSILCA proxy countries cannot define geographic coverage"
+                        )
+                    excluded_countries.update(c.strip() for c in geography.split(";") if c.strip())
+                psilca = "; ".join(sorted(base - excluded_countries))
+                if not psilca:
+                    raise ValueError(
+                        f"Activity {row['code']!r} has an empty {iso2} country mapping"
+                    )
 
                 row_dict = row.drop(labels="ISO2").to_dict()
                 row_dict["PSILCA_mapping"] = psilca
@@ -848,30 +885,44 @@ def fetch_ecoinvent_activities_from_ecospold_files(
 
             final_output.append({"ISO2": iso2, "Activities": activities})
         else:
-            psilca = iso2_to_psilca.get(iso2)
-            if psilca:
+            mapped_psilca = iso2_to_psilca.get(iso2)
+            if not isinstance(mapped_psilca, str) or not mapped_psilca.strip():
+                raise ValueError(
+                    f"Location {iso2!r} has no usable country mapping for activities "
+                    f"{group['code'].tolist()[:8]}"
+                )
+            if mapped_psilca:
                 activities = group.drop(columns="ISO2").to_dict(orient="records")
-                final_output.append({"ISO2": iso2, "PSILCA_mapping": psilca, "Activities": activities})
+                final_output.append(
+                    {
+                        "ISO2": iso2,
+                        "PSILCA_mapping": mapped_psilca,
+                        "Activities": activities,
+                    }
+                )
 
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(final_output, f, indent=2, ensure_ascii=False)
+    for entry in final_output:
+        for activity in entry["Activities"]:
+            if pd.isna(activity.get("price")):
+                activity["price"] = None
+    write_json_atomic(Path(output_path), final_output)
+    logger.info("Saved enriched activity data to %s", output_path)
 
-    print(f"\n✅ Saved enriched activity data to: {output_path}")
+    # Log unresolved activities (if any remain after accepting price=0)
+    if n_not_found:
+        logger.info("  %d activities have no price (not even zero).", n_not_found)
 
-    # Diagnostics report
-    if missing_price_report_path and not_found_records:
-        os.makedirs(os.path.dirname(missing_price_report_path), exist_ok=True)
-        report_df = pd.DataFrame(not_found_records).drop_duplicates(subset=["code", "reason"])
-        ext = os.path.splitext(missing_price_report_path)[1].lower()
-        if ext in (".xlsx", ".xls"):
-            report_df.to_excel(missing_price_report_path, index=False)
-        elif ext == ".json":
-            report_df.to_json(missing_price_report_path, orient="records", indent=2, force_ascii=False)
-        else:
-            report_df.to_csv(missing_price_report_path, index=False, encoding="utf-8")
-        print(f"🧾 Wrote 'no price found' report with {len(report_df)} rows to: {missing_price_report_path}")
-
+    df.attrs["pricing_dependency_databases"] = sorted(
+        {
+            source_database,
+            technosphere,
+            *(
+                str(meta.get("database"))
+                for meta in (graph.id_to_meta if graph is not None else [])
+                if meta.get("database")
+            ),
+        }
+    )
     return df
 
 
@@ -880,72 +931,55 @@ def embed_ecoinvent_to_store(
     out_dir: str,
     model_name: str = "BAAI/bge-base-en-v1.5",
     batch_size: int = 256,
-    target_iso2: Optional[str] = None,
-    target_iso2_list: Optional[List[str]] = None,
+    *,
+    target_iso2_list: list[str],
+    force: bool = False,
+    revision: str | None = None,
 ) -> None:
     """
     Embed ecoinvent activities and save to disk.
-    
+
     Creates embedding stores for ecoinvent activities per ISO2 region:
       - {out_dir}/ecoinvent_{ISO2}.npy
       - {out_dir}/ecoinvent_{ISO2}.manifest.json
-    
+
     Skips already-existing stores to avoid redundant computation.
-    
+
     Args:
         technosphere_json: Path to the activity list JSON file
         out_dir: Directory to save embedding stores
         model_name: Name of the sentence-transformer model to use
         batch_size: Batch size for embedding computation
-        target_iso2: Single ISO2 code to embed (deprecated, use target_iso2_list)
-        target_iso2_list: List of ISO2 codes to embed
-        
+        target_iso2_list: ISO2 codes to embed.
+        force: Rebuild stores even when their manifests match.
+
     Note:
         Requires the `sentence-transformers` package.
     """
-    from sentence_transformers import SentenceTransformer
-    
     os.makedirs(out_dir, exist_ok=True)
 
-    # Normalize inputs
-    if target_iso2_list is None and target_iso2 is None:
-        raise ValueError("Provide either target_iso2 (str) or target_iso2_list (List[str]).")
-    if target_iso2_list is None:
-        target_iso2_list = [target_iso2]
-    else:
-        if target_iso2 is not None:
-            target_iso2_list = list({*target_iso2_list, target_iso2})
+    if not target_iso2_list:
+        raise ValueError("target_iso2_list must contain at least one region")
 
-    def safe(name: str) -> str:
-        return (str(name)
-                .replace("/", "_").replace("\\", "_").replace(":", "_")
-                .replace("-", "_").replace(" ", "_"))
+    with open(technosphere_json, encoding="utf-8") as input_handle:
+        data = json.load(input_handle)
 
-    # Find missing ISO2 stores
-    missing_iso2s: List[str] = []
+    # Build the exact input rows before checking caches. A store is reusable
+    # only when model, prompt, identifiers, and embedded text are unchanged.
+    from sense.data.embeddings import model_revision
+
+    resolved_revision = model_revision(model_name, revision)
+    prepared: dict[str, tuple[pd.DataFrame, dict[str, Any]]] = {}
+    missing_iso2s: list[str] = []
     for iso2 in target_iso2_list:
-        base_name = f"ecoinvent_{safe(iso2)}"
-        if not store_is_complete(out_dir, base_name):
-            missing_iso2s.append(iso2)
-
-    if not missing_iso2s:
-        print(f"✅ All ecoinvent per-location stores already present in {out_dir}. Nothing to do.")
-        return
-
-    # Load data & model once
-    with open(technosphere_json, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    model = SentenceTransformer(model_name)
-
-    # Embed missing ISO2s
-    for iso2 in tqdm(missing_iso2s, desc="📦 Embedding ecoinvent activities (missing only)"):
-        base_name = f"ecoinvent_{safe(iso2)}"
-
+        base_name = f"ecoinvent_{safe_name(iso2)}"
         rows = []
         for loc in data:
             if loc.get("ISO2") != iso2:
                 continue
             for act in loc.get("Activities", []):
+                if act.get("calculation route") == "zero":
+                    continue
                 code = (act.get("code") or "").strip()
                 name = (act.get("name") or "").strip()
                 ref = (act.get("reference product") or "").strip()
@@ -956,8 +990,48 @@ def embed_ecoinvent_to_store(
 
         if not rows:
             continue
+        df = (
+            pd.DataFrame(rows, columns=["code", "text"])
+            .drop_duplicates("code")
+            .sort_values("code", kind="stable")
+            .reset_index(drop=True)
+        )
+        encoded_texts = df["text"].map(prep_query_bge).tolist()
+        meta = {
+            "model": model_name,
+            "revision": resolved_revision,
+            "prompt": BGE_QUERY_PROMPT,
+            "normalized": True,
+            "source": "ecoinvent_activities",
+            "iso2": iso2,
+            "input_hash": _sha(json.dumps(encoded_texts, ensure_ascii=False)),
+        }
+        prepared[iso2] = (df, meta)
+        if force or not _embedding_store_matches_content(out_dir, base_name, df, meta):
+            missing_iso2s.append(iso2)
 
-        df = pd.DataFrame(rows, columns=["code", "text"]).drop_duplicates("code")
+    if not missing_iso2s:
+        logger.info("All ecoinvent embedding stores are current in %s", out_dir)
+        return
+
+    logger.info("Creating %d ecoinvent embedding stores", len(missing_iso2s))
+    logger.info("Loading embedding model '%s'...", model_name)
+    from tqdm import tqdm
+
+    from sense.data.embeddings import load_encoder
+
+    model = load_encoder(model_name, revision=resolved_revision)
+
+    # Embed missing ISO2s
+    for iso2 in tqdm(
+        missing_iso2s,
+        desc="Embedding ecoinvent regions",
+        unit="region",
+        dynamic_ncols=True,
+    ):
+        base_name = f"ecoinvent_{safe_name(iso2)}"
+
+        df, meta = prepared[iso2]
 
         embeddings = model.encode(
             df["text"].map(prep_query_bge).tolist(),
@@ -967,19 +1041,6 @@ def embed_ecoinvent_to_store(
             show_progress_bar=False,
         ).astype("float32")
 
-        meta = {
-            "model": model_name,
-            "prompt": BGE_QUERY_PROMPT,
-            "normalized": True,
-            "source": "ecoinvent_activities",
-            "iso2": iso2,
-        }
-
         save_embeddings(out_dir, base_name, embeddings, df["code"], meta)
-    
-    print(f"✅ Finished ecoinvent combined embeddings → {out_dir}")
 
-
-def clean(text: str) -> str:
-    """Lowercase, strip, collapse whitespace."""
-    return re.sub(r'\s+', ' ', (text or "").replace('\xa0', ' ').strip().lower())
+    logger.info("Finished ecoinvent embedding stores in %s", out_dir)

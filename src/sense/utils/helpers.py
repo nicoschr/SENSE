@@ -1,39 +1,13 @@
-"""
-Common helper functions used throughout SENSE.
-"""
+"""Small normalization helpers shared across SENSE."""
 
 from __future__ import annotations
 
 import re
-from typing import Any, Optional
+from typing import Any
 
 
-def norm_code(x: Any) -> Optional[str]:
-    """
-    Normalize activity codes to simple stripped strings.
-
-    Handles various formats that may occur in Brightway databases:
-    - ('abc',) -> "abc"
-    - ["abc"]  -> "abc"
-    - None     -> None
-    - everything else -> str(x).strip()
-    
-    Args:
-        x: The code to normalize (may be a string, tuple, list, or None)
-        
-    Returns:
-        Normalized string code, or None if input was None
-        
-    Examples:
-        >>> norm_code("abc")
-        'abc'
-        >>> norm_code(('abc',))
-        'abc'
-        >>> norm_code(['abc'])
-        'abc'
-        >>> norm_code(None) is None
-        True
-    """
+def norm_code(x: Any) -> str | None:
+    """Return a stripped activity code, unwrapping one-item tuples and lists."""
     if x is None:
         return None
     if isinstance(x, (tuple, list)) and len(x) == 1:
@@ -42,53 +16,63 @@ def norm_code(x: Any) -> Optional[str]:
 
 
 def safe_name(name: str) -> str:
-    """
-    Normalize strings for use in filenames.
-    
-    Replaces problematic characters with underscores and collapses
-    multiple underscores into one.
-    
-    Args:
-        name: The string to normalize
-        
-    Returns:
-        Filesystem-safe string
-        
-    Examples:
-        >>> safe_name("my/file:name")
-        'my_file_name'
-        >>> safe_name("hello  world")
-        'hello_world'
-    """
+    """Replace separators and whitespace with underscores for file names."""
     s = str(name)
-    bad = "/\\:- "
-    for ch in bad:
+    for ch in "/\\:- ":
         s = s.replace(ch, "_")
-    while "__" in s:
-        s = s.replace("__", "_")
     return s
 
 
+def extract_isic2(raw_isic: str) -> str | None:
+    """Extract an ISIC two-digit division, or return ``None`` if unavailable."""
+    if not raw_isic or not isinstance(raw_isic, str):
+        return None
+    # Take the part before the colon (or the whole string)
+    numeric = raw_isic.split(":")[0].strip()
+    # Extract only digits
+    digits = re.sub(r"[^0-9]", "", numeric)
+    if len(digits) < 2:
+        return None
+    return digits[:2]
+
+
 def slug(s: str) -> str:
-    """
-    Turn an arbitrary string into a filesystem-safe slug.
-    
-    Converts to lowercase, replaces whitespace with underscores,
-    and removes non-alphanumeric characters.
-    
-    Args:
-        s: Input string
-        
-    Returns:
-        Slugified string
-        
-    Examples:
-        >>> slug("ecoinvent-3.10-cutoff regionalized")
-        'ecoinvent-3-10-cutoff_regionalized'
-        >>> slug("Hello World!")
-        'hello_world'
-    """
+    """Return a lowercase, filesystem-safe slug."""
     s = s.lower()
     s = re.sub(r"\s+", "_", s)
     s = re.sub(r"[^a-z0-9_]+", "-", s)
     return s.strip("-_")
+
+
+# Ecoinvent location names that need manual ISO2 assignment.
+# Single source of truth — imported by both ecoinvent.py and productivity/geography.py.
+ECOINVENT_NAME_TO_ISO2 = {
+    "Clipperton Island": "FR",
+    "Canary Islands": "ES",
+    "France, including overseas territories": "FR",
+    "Australia, including overseas territories": "AU",
+    "Puerto Rico": "US",
+    "China without Inner Mongol": "CN",
+    "Canada without Alberta": "CA",
+    "Canada without Alberta and Quebec": "CA",
+    "Canada without Quebec": "CA",
+    "Russia (Europe)": "RU",
+    "Russia (Asia)": "RU",
+    "Coral Sea Islands": "AU",
+    "Kosovo": "XK",
+    "Serranilla Bank": "CO",
+    "Spratly Islands": "PH",
+    "Dhekelia Sovereign Base Area": "CY",
+    "Serbia and Montenegro": "RS",
+    "Cyprus No Mans Area": "CY",
+    "Siachen Glacier": "IN",
+    "Akrotiri Sovereign Base Area": "GB",
+    "Bajo Nuevo Bank (Petrel Is.)": "CO",
+    "Taiwan": "TW",
+    "Scarborough Reef": "PH",
+    "Northern Cyprus": "CY",
+    "US Naval Base Guantanamo Bay": "CU",
+    "Somaliland": "SO",
+    "Québec, Hydro-Québec distribution network": "CA",
+    "Namibia": "NA",
+}

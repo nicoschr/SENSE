@@ -1,4 +1,5 @@
 # Byte-compiled / optimized / DLL files
+case_studies/semantic_matching/results/
 __pycache__/
 *.py[cod]
 
@@ -96,20 +97,45 @@ target/
 *.pkl
 Data/
 Data - Copy/
-!src/SENSE/data/
-notebooks/.cache_natural_earth
-notebooks/*.xlsx
+!src/sense/data/
+/notebooks/
 input_data.zip
+
+# Local comparison checkout
+/sense_dev/
+
+# Hydrogen local configuration and historical outputs (new outputs are under Data/)
+/case_studies/hydrogen/config.local.yaml
+/case_studies/hydrogen/notebooks/.cache_*/
+/case_studies/hydrogen/notebooks/*.svg
+/case_studies/hydrogen/notebooks/*.xlsx
 
 # Data / export files
 *.json
 *.flag
 *.npy
+*.npz
 *.csv
 *.xml
 *.spold
 *.spold2
+*.zolca
+*.parquet
 
-# Notebook caches
-notebooks/.cache_soca/
-notebooks/.cache_*/
+# Redistributable package resources (explicitly reviewed and attributed)
+!src/sense/resources/
+!src/sense/resources/world_bank_gdp_current_usd_2000_2024.csv
+!src/sense/resources/imf_weo_gdp_current_usd_2000_2024.csv
+!src/sense/resources/imf_weo_gdp_current_usd_2000_2024.json
+!src/sense/resources/zolca/reader-build.json
+
+# Aggregate matching-audit results, without licensed source descriptions or labels.
+!case_studies/hydrogen/resources/matching_audit/encoder_metrics.csv
+!case_studies/hydrogen/resources/matching_audit/threshold_curve.csv
+!case_studies/hydrogen/resources/matching_audit/provenance.json
+
+# Private study selectors must never enter a source release.
+*.local.json
+
+# Local audit environments and detailed verification evidence.
+/.review/

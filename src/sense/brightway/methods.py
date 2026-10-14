@@ -1,152 +1,97 @@
-"""
-Brightway2 impact category (Method) creation for SENSE.
-
-This module provides functions for creating LCIA methods from social flows.
-"""
+"""Synchronize LCIA methods owned by one SENSE sociosphere database."""
 
 from __future__ import annotations
 
+import re
 from collections import defaultdict
-from typing import Dict, Set
+from typing import Any
 
-from bw2data import Method, Database, methods
-from tqdm import tqdm
+from bw2data import Database, Method, methods
+
+
+def _owned(metadata: dict, database: str, kind: str) -> bool:
+    return metadata.get("sense_database") == database and metadata.get("sense_kind") == kind
+
+
+def _sync_methods(database: str, kind: str, desired: dict[tuple, tuple[str, list]]) -> None:
+    """Validate ownership before replacing methods; remove only owned stale keys."""
+    for key in desired:
+        if key in methods and not _owned(methods[key], database, kind):
+            raise ValueError(f"Refusing to overwrite a method not owned by SENSE: {key!r}")
+    existing = {key for key in methods if _owned(methods[key], database, kind)}
+    for key, (unit, cfs) in desired.items():
+        cfs = sorted(cfs)
+        method = Method(key)
+        if key not in methods:
+            method.register(
+                unit=unit,
+                sense_database=database,
+                sense_kind=kind,
+                description=f"SENSE {kind} method for {database}.",
+            )
+        else:
+            if method.metadata.get("unit") == unit and sorted(method.load()) == cfs:
+                continue
+            method.metadata = {**method.metadata, "unit": unit}
+        method.write(cfs)
+    for key in existing - desired.keys():
+        Method(key).deregister()
+
+
+def remove_impact_categories(biosphere_db_name: str, kind: str) -> int:
+    """Remove methods of one kind owned by the specified sociosphere."""
+    count = sum(_owned(methods[key], biosphere_db_name, kind) for key in methods)
+    _sync_methods(biosphere_db_name, kind, {})
+    return count
 
 
 def add_social_impact_categories(biosphere_db_name: str) -> None:
+    """Create unit-CF methods for typed social flows in this sociosphere.
+
+    Keys are ``('SENSE', database, category, subcategory, indicator, type)``.
+    User flows without explicit SENSE ownership metadata are not included.
     """
-    Create one impact method per social indicator from the sociosphere database.
-    
-    Scans the sociosphere database for social flows and creates LCIA methods
-    for each unique indicator. Each method includes all flows for that indicator
-    across all regions and types (risk/opportunity).
-    
-    Method key format: (category, subcategory, indicator_name)
-    
-    Args:
-        biosphere_db_name: Name of the sociosphere database containing social flows
-        
-    Note:
-        Only processes flows with the SENSE comment marker.
-        Working hours flows are handled separately.
-        
-    Examples:
-        >>> add_social_impact_categories("sociosphere")
-    """
-    biosphere = Database(biosphere_db_name)
-
-    # (cat, subcat, indicator_name) -> set(units)
-    indicator_units: Dict[tuple, Set[str]] = defaultdict(set)
-
-    for flow in biosphere:
-        # Only use flows created by SENSE
-        comment = flow.get("comment") or ""
-        if "Imported from PSILCA sector matching (country-resolved, typed)" not in comment:
+    grouped: dict[tuple, list[Any]] = defaultdict(list)
+    for flow in Database(biosphere_db_name):
+        if flow.get("sense_kind") != "social":
             continue
-
-        cats = flow.get("categories") or ()
-        if not cats:
+        match = re.match(r"^(.*) \((risk|opportunity)\), .+$", flow.get("name") or "")
+        if match is None:
             continue
-
-        name = flow.get("name") or ""
-        # Skip working-hours flows
-        if name.startswith("working hours, "):
-            continue
-        if " (" not in name:
-            continue
-
-        indicator_name = name.split(" (", 1)[0]
-        cat, subcat = (cats[0], cats[1]) if len(cats) >= 2 else ("Social", "Unknown")
-        unit = flow.get("unit") or ""
-
-        indicator_units[(cat, subcat, indicator_name)].add(unit)
-
-    if not indicator_units:
-        print("⚠️ No social indicator flows found in sociosphere DB; no methods created.")
-        return
-
-    # Create/overwrite methods and attach CFs
-    for (cat, subcat, indicator_name), units in tqdm(
-        indicator_units.items(), desc="⚙️ Creating social impact methods"
-    ):
-        method_key = (cat, subcat, indicator_name)
-
-        # Choose a representative unit
-        chosen_unit = next(iter(units)) if units else ""
-        if len(units) > 1:
-            print(
-                f"⚠️ Mixed units for {method_key}: {sorted(units)}. "
-                f"Using '{chosen_unit}' for the method unit."
-            )
-
-        # Overwrite if exists
-        if method_key in methods:
-            Method(method_key).deregister()
-
-        method = Method(method_key)
-        method.register(
-            unit=chosen_unit or "",
-            description=(
-                "Auto-generated from SENSE social flows in sociosphere "
-                "(all regions, both risk and opportunity)."
-            ),
-        )
-
-        # Collect all matching flows
-        prefix = f"{indicator_name} ("
-        cfs = [
-            (flow.key, 1.0)
-            for flow in biosphere
-            if str(flow.get("name", "")).startswith(prefix)
-        ]
-
-        if not cfs:
-            print(
-                f"⚠️ No matching flows found for indicator {method_key}; "
-                "method will be empty."
-            )
-            continue
-
-        method.write(cfs)
+        cats: Any = flow.get("categories") or ()
+        category, subcategory = cats[:2] if len(cats) >= 2 else ("Social", "Unknown")
+        grouped[("SENSE", biosphere_db_name, category, subcategory, *match.groups())].append(flow)
+    desired = {}
+    for key, flows in grouped.items():
+        units = {str(flow.get("unit") or "") for flow in flows}
+        if len(units) != 1:
+            raise ValueError(f"Mixed units for {key}: {sorted(units)}")
+        desired[key] = (units.pop(), [(flow.key, 1.0) for flow in flows])
+    _sync_methods(biosphere_db_name, "social", desired)
 
 
 def add_working_hours_impact_category(biosphere_db_name: str) -> None:
-    """
-    Create a single impact method that sums all working hours flows.
-    
-    Creates a method that aggregates all 'working hours, <region>' flows
-    with characterization factor = 1.
-    
-    Method key: ('Social', 'Working hours', 'working hours')
-    
-    Args:
-        biosphere_db_name: Name of the sociosphere database
-        
-    Examples:
-        >>> add_working_hours_impact_category("sociosphere")
-    """
-    biosphere = Database(biosphere_db_name)
+    """Synchronize the aggregate working-hours method for this sociosphere."""
+    cfs = [
+        (flow.key, 1.0)
+        for flow in Database(biosphere_db_name)
+        if flow.get("sense_kind") == "working_hours"
+    ]
+    key = ("SENSE", biosphere_db_name, "Social", "Working hours", "working hours")
+    _sync_methods(biosphere_db_name, "working_hours", {key: ("h", cfs)} if cfs else {})
 
-    method_key = ("Social", "Working hours", "working hours")
 
-    # Overwrite if exists
-    if method_key in methods:
-        Method(method_key).deregister()
-
-    method = Method(method_key)
-    method.register(
-        unit="h",
-        description="Total working hours (sum of all 'working hours, <region>' flows)",
-    )
-
-    cfs = []
-    for flow in biosphere:
-        name = str(flow.get("name", ""))
-        if name.startswith("working hours, "):
-            cfs.append((flow.key, 1.0))
-
-    if not cfs:
-        print("⚠️ No 'working hours, <region>' flows found in biosphere DB; method will be empty.")
-        return
-
-    method.write(cfs)
+def add_working_hours_impact_categories_by_isic(biosphere_db_name: str) -> None:
+    """Synchronize per-ISIC working-hours methods, including empty-state cleanup."""
+    grouped: dict[str, list] = defaultdict(list)
+    for flow in Database(biosphere_db_name):
+        if flow.get("sense_kind") != "working_hours_isic":
+            continue
+        match = re.match(r"^working hours, isic(\d{2}), ", str(flow.get("name") or ""))
+        if match:
+            grouped[match[1]].append((flow.key, 1.0))
+    desired = {
+        ("SENSE", biosphere_db_name, "Social", "Working hours by ISIC", f"ISIC {isic}"): ("h", cfs)
+        for isic, cfs in grouped.items()
+    }
+    _sync_methods(biosphere_db_name, "working_hours_isic", desired)

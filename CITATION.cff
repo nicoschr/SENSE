@@ -1,0 +1,20 @@
+cff-version: 1.2.0
+message: "Please cite the exact SENSE software version or commit used in your work."
+type: software
+title: "SENSE: Social and Environmental Nexus for Sustainability Evaluation"
+authors:
+  - given-names: "Nicolas"
+    family-names: "Schröder"
+  - given-names: "Fabian"
+    family-names: "Lechtenberg"
+  - given-names: "Gonzalo"
+    family-names: "Guillén Gosálbez"
+version: "1.1.0"
+repository-code: "https://github.com/nicoschr/SENSE"
+url: "https://github.com/nicoschr/SENSE"
+license: MIT
+abstract: >-
+  SENSE maps PSILCA social risk and opportunity indicators onto Brightway
+  process inventories, including ecoinvent and custom databases, for calculation
+  alongside environmental life-cycle impacts. Social scores support risk and
+  opportunity assessment. The software licence does not replace input-data licences.

@@ -1,435 +1,840 @@
-"""
-Sector averaging with price weighting for SENSE.
-
-This module provides functions for averaging social indicators across
-matched PSILCA sectors, applying risk-level weights and price scaling.
-"""
+"""Convert and aggregate PSILCA sector assessments for ecoinvent activities."""
 
 from __future__ import annotations
 
-from collections import defaultdict, Counter
-from typing import Any, Dict, List, Optional
+import math
+from collections import Counter, defaultdict
+from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import pandas as pd
 
+from sense.utils.helpers import norm_code
 
-def _geometric_mean_strict(values: List[float], context: str = "") -> float:
-    """
-    Compute robust geometric mean.
-    
-    - Returns NaN if values is empty after filtering
-    - Returns NaN if any negatives
-    - Drops zeros (treated as missing data)
-    
-    Args:
-        values: List of values to average
-        context: Context string for warning messages
-        
-    Returns:
-        Geometric mean of positive values, or NaN if invalid
-    """
-    arr = np.asarray(values, dtype=float)
-    ctx = f" ({context})" if context else ""
+IndicatorKey = tuple[str, Any, str, Any, Any]
 
-    arr = arr[~np.isnan(arr)]
 
-    if arr.size == 0:
-        return float("nan")
+@dataclass(slots=True)
+class _SectorProfile:
+    """Reusable numerical representation of one PSILCA country-sector."""
 
-    if np.any(arr < 0):
-        print(f"⚠️ Geometric mean received negative values{ctx}. Returning NaN.")
-        return float("nan")
+    psilca_totals: dict[IndicatorKey, float]
+    psilca_counts: Counter[IndicatorKey]
+    override_totals: dict[IndicatorKey, float]
+    override_counts: Counter[IndicatorKey]
+    psilca_diagnostics: Counter[str]
+    override_diagnostics: Counter[str]
+    working_hours: float | None
+    inconsistent_hours: tuple[float, ...]
 
-    if np.any(arr == 0):
-        print(f"⚠️ Geometric mean received zero values{ctx}. Treating as missing (NaN).")
-        arr = arr[arr > 0]
-        if arr.size == 0:
-            return float("nan")
 
-    return float(np.exp(np.log(arr).mean()))
+@dataclass(slots=True)
+class _ActivityState:
+    """Metadata and audit state retained while activities are aggregated."""
 
-def _arithmetic_mean_strict(values: List[float], context: str = "") -> float:
-    """
-    Compute robust arithmetic mean.
-    - Returns NaN if values is empty after filtering
-    - Returns NaN if any negatives
-    """
-    arr = np.asarray(values, dtype=float)
-    arr = arr[np.isfinite(arr)]
-    if arr.size == 0:
-        return np.nan
-    if np.any(arr < 0):
-        print(f"[WARN] Negative value(s) encountered in arithmetic mean: {context}")
-        return np.nan
-    return float(arr.mean())
+    meta: dict[str, Any]
+    price: float
+    override_hours: float | None
+    direct_hours: float | None
+    conversion_factor: float
+    country_weights: dict[str, float]
+    weighting_methods: list[str]
+    reference_year: int | None
+    data_years: dict[str, int]
+    countries: set[Any]
+    sectors: dict[Any, set[Any]]
+    processes: dict[Any, set[str]]
+    diagnostics: Counter[str]
 
-def _aggregate_strict(values: List[float], method: str, context: str = "") -> float:
-    method = (method or "").strip().lower()
-    if method == "geometric":
-        return _geometric_mean_strict(values, context=context)
-    if method == "arithmetic":
-        return _arithmetic_mean_strict(values, context=context)
-    raise ValueError(f"Unknown averaging method: {method!r} (use 'geometric' or 'arithmetic')")
+
+@dataclass(frozen=True, slots=True)
+class _InputRow:
+    """Only the enriched columns required by aggregation."""
+
+    activity_code: Any
+    activity_name: Any
+    reference_product: Any
+    isic: Any
+    unit: Any
+    iso2: Any
+    price: Any
+    country: Any
+    sector: Any
+    process: Any
+    exchanges: Any
+    country_weight: Any
+    weighting_method: Any
+    weight_reference_year: Any
+    weight_data_year: Any
+
+
+@dataclass(slots=True)
+class _CrossCountryAggregation:
+    """Weighted and fallback accumulators for one indicator matrix."""
+
+    weighted: np.ndarray
+    weight_sums: np.ndarray
+    unweighted: np.ndarray
+    country_counts: np.ndarray
+
+    @classmethod
+    def zeros(cls, shape: tuple[int, int]) -> _CrossCountryAggregation:
+        return cls(
+            weighted=np.zeros(shape, dtype=np.float64),
+            weight_sums=np.zeros(shape, dtype=np.float64),
+            unweighted=np.zeros(shape, dtype=np.float64),
+            country_counts=np.zeros(shape, dtype=np.float64),
+        )
+
+    def add(
+        self,
+        activity_ids: np.ndarray,
+        country_means: np.ndarray,
+        valid: np.ndarray,
+        country_weights: np.ndarray,
+    ) -> None:
+        weighted_values = country_means * country_weights[:, None] * valid
+        self.weighted[activity_ids] += weighted_values
+        self.weight_sums[activity_ids] += country_weights[:, None] * valid
+        self.unweighted[activity_ids] += country_means * valid
+        self.country_counts[activity_ids] += valid
+        if (
+            np.isinf(self.weighted[activity_ids]).any()
+            or np.isinf(self.unweighted[activity_ids]).any()
+        ):
+            raise ValueError(
+                "Non-finite computed country aggregation; reduce overflowing input values"
+            )
+
+    def finish(self, *, exponentiate: bool) -> np.ndarray:
+        result = np.full(self.weighted.shape, np.nan, dtype=np.float64)
+        weighted_mask = self.weight_sums > 0
+        result[weighted_mask] = self.weighted[weighted_mask] / self.weight_sums[weighted_mask]
+        fallback_mask = ~weighted_mask & (self.country_counts > 0)
+        result[fallback_mask] = self.unweighted[fallback_mask] / self.country_counts[fallback_mask]
+        if exponentiate:
+            with np.errstate(over="ignore"):
+                np.exp(result, out=result, where=np.isfinite(result))
+        if np.isinf(result).any():
+            raise ValueError("Non-finite computed aggregation result")
+        return result
+
+
+def _build_sector_profile(
+    exchanges: Any,
+    level_weights: dict[str, float],
+    *,
+    geometric: bool,
+) -> _SectorProfile:
+    """Parse one sector once into additive totals used by matrix aggregation."""
+
+    psilca_totals: dict[IndicatorKey, float] = defaultdict(float)
+    psilca_counts: Counter[IndicatorKey] = Counter()
+    override_totals: dict[IndicatorKey, float] = defaultdict(float)
+    override_counts: Counter[IndicatorKey] = Counter()
+    psilca_diagnostics: Counter[str] = Counter()
+    override_diagnostics: Counter[str] = Counter()
+
+    if not exchanges or not isinstance(exchanges, list):
+        return _SectorProfile(
+            {},
+            Counter(),
+            {},
+            Counter(),
+            psilca_diagnostics,
+            override_diagnostics,
+            None,
+            (),
+        )
+
+    sector_hours: list[float] = []
+    for exchange in exchanges:
+        try:
+            candidate = float(exchange.get("meanValue", np.nan))
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(candidate) and candidate > 0:
+            sector_hours.append(candidate)
+
+    working_hours = sector_hours[0] if sector_hours else None
+    inconsistent_hours: tuple[float, ...] = ()
+    if working_hours is not None and not np.allclose(
+        sector_hours,
+        working_hours,
+        rtol=1e-9,
+        atol=0.0,
+    ):
+        inconsistent_hours = tuple(sorted(set(sector_hours))[:10])
+
+    no_data_weight = float(level_weights.get("no data", 1.0))
+
+    for exchange in exchanges:
+        indicator = (exchange.get("indicator") or "").strip()
+        exchange_type = (exchange.get("type") or "risk").strip().lower()
+        if exchange_type not in {"risk", "opportunity"}:
+            raise ValueError(
+                f"Unsupported social exchange type {exchange_type!r} "
+                f"for indicator {indicator!r}"
+            )
+        if not indicator:
+            psilca_diagnostics["indicator_missing"] += 1
+            override_diagnostics["indicator_missing"] += 1
+            continue
+
+        key: IndicatorKey = (
+            indicator,
+            exchange.get("unit", "h"),
+            exchange_type,
+            exchange.get("category", "Unknown"),
+            exchange.get("subcategory", "Unknown"),
+        )
+        level_raw = (exchange.get("risk level") or "").strip()
+        level = level_raw.lower() if level_raw else ""
+        level_missing = level in {"", "?", "unknown"}
+        configured_weight = level_weights.get(level) if not level_missing else None
+        if level_missing:
+            weight = no_data_weight
+            weight_diagnostic = "risk_level_missing_or_unknown"
+        elif configured_weight is None:
+            weight = no_data_weight
+            weight_diagnostic = "risk_level_unmapped"
+        else:
+            weight = float(configured_weight)
+            weight_diagnostic = None
+
+        # Productivity overrides replace PSILCA hours, so only the qualitative
+        # level multiplier enters their reusable sector profile.
+        if weight_diagnostic is not None:
+            override_diagnostics[weight_diagnostic] += 1
+        if weight <= 0:
+            override_diagnostics["risk_weight_non_positive"] += 1
+        elif not math.isfinite(weight):
+            override_diagnostics["weighted_non_positive_or_nan"] += 1
+        else:
+            transformed = math.log(weight) if geometric else weight
+            override_totals[key] += transformed
+            override_counts[key] += 1
+
+        try:
+            raw_hours = float(exchange.get("meanValue", np.nan))
+        except (TypeError, ValueError):
+            raw_hours = float("nan")
+        if not math.isfinite(raw_hours):
+            psilca_diagnostics["working_hours_missing_or_nan"] += 1
+            continue
+        if raw_hours <= 0:
+            psilca_diagnostics[
+                "working_hours_negative" if raw_hours < 0 else "working_hours_non_positive"
+            ] += 1
+            continue
+        if weight_diagnostic is not None:
+            psilca_diagnostics[weight_diagnostic] += 1
+        if weight <= 0:
+            psilca_diagnostics["risk_weight_non_positive"] += 1
+            continue
+        weighted = raw_hours * weight
+        if math.isinf(weighted):
+            raise ValueError(f"Non-finite computed risk-weighted hours for {indicator!r}")
+        if not math.isfinite(weighted) or weighted <= 0:
+            psilca_diagnostics["weighted_non_positive_or_nan"] += 1
+            continue
+        transformed = math.log(weighted) if geometric else weighted
+        psilca_totals[key] += transformed
+        psilca_counts[key] += 1
+
+    return _SectorProfile(
+        dict(psilca_totals),
+        psilca_counts,
+        dict(override_totals),
+        override_counts,
+        psilca_diagnostics,
+        override_diagnostics,
+        working_hours,
+        inconsistent_hours,
+    )
+
 
 def average_sector_mappings_w_prices(
     enriched_df: pd.DataFrame,
-    level_weights: Dict[str, float],
-    tiny_threshold: float = 1e-9,
-    rounding: Optional[int] = None,
+    level_weights: dict[str, float],
+    rounding: int | None = None,
     mean_method: str = "geometric",
-) -> List[Dict[str, Any]]:
-    """
-    Compute final 'medium risk/opportunity hours' per activity.
-    
+    hours_override: dict[str, float] | None = None,
+    psilca_price_factor: float = 1.0,
+    productivity_price_factor: float | None = None,
+    direct_hours_override: dict[str, float] | None = None,
+) -> list[dict[str, Any]]:
+    """Compute medium-equivalent risk or opportunity hours per activity.
+
     The averaging process:
     1) Risk-weighted working hours: r_ik = hours_per_USD * price * c(level)
     2) Geometric or arithmetic mean across PSILCA sectors (per country)
-    3) Geometric or arithmetic across PSILCA countries (per activity)
-    
-    Also computes per-activity 'Working_hours' as arithmetic mean of
-    unweighted working hours across countries/sectors.
-    
-    Args:
-        enriched_df: DataFrame with matched sectors and PSILCA exchanges
-        level_weights: Mapping from risk level strings to numeric weights
-        tiny_threshold: Threshold for counting "tiny" values in diagnostics
-        rounding: Number of decimal digits to round to (None for no rounding)
-        
-    Returns:
-        List of activity dictionaries with 'Averaged_Exchanges' and 'Working_hours'
-        
-    Examples:
-        >>> from sense.config import SenseConfig
-        >>> cfg = SenseConfig()
-        >>> results = average_sector_mappings_w_prices(
-        ...     enriched_df=enriched_df,
-        ...     level_weights=cfg.level_weights,
-        ... )
-    """
-    final_activities: List[Dict[str, Any]] = []
-    type_map: Dict[str, set] = defaultdict(set)
-    count_map: Dict[str, int] = defaultdict(int)
+    3) Configured country-weighted geometric or arithmetic mean across PSILCA
+       countries (per activity; equal weights when no Country_weight column is
+       present)
 
-    # Price handling
+    Also computes per-activity 'Working_hours' as arithmetic mean of
+    working hours across sectors, followed by a weighted arithmetic mean
+    across countries.
+
+    When hours_override is provided, activities with an entry in the dict
+    use the override value (hours per USD from an external productivity
+    baseline) instead of PSILCA's meanValue for both risk scaling and
+    working hours. PSILCA risk levels are still used for weighting.
+    Activities without an override fall back to PSILCA hours.
+
+    Args:
+        enriched_df: Matched sectors with PSILCA exchanges and positive prices.
+        level_weights: Numeric multiplier for each qualitative assessment level.
+        rounding: Decimal places for results; ``None`` preserves full precision.
+        mean_method: ``"geometric"`` or ``"arithmetic"`` for social flows.
+        hours_override: Optional dict mapping Activity code to hours-per-USD
+            from an external productivity baseline. When present, replaces
+            PSILCA's meanValue for that activity.
+        direct_hours_override: Direct hours per physical reference unit. Bypasses
+            prices, monetary conversion and labour intensities, retaining risk
+            factors and geographic/sector aggregation. Never a monetary seed.
+        psilca_price_factor: Multiplier converting activity prices into the
+            monetary basis of PSILCA worker-hour intensities.
+        productivity_price_factor: Multiplier converting activity prices into
+            the external productivity baseline's monetary basis. Defaults to
+            1.0 when no external conversion is configured.
+
+    Returns:
+        Activity records containing ``Averaged_Exchanges`` and ``Working_hours``.
+    """
+
+    def _validated_factor(value: float, name: str) -> float:
+        try:
+            factor = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{name} must be a positive finite number") from exc
+        if not math.isfinite(factor) or factor <= 0:
+            raise ValueError(f"{name} must be a positive finite number")
+        return factor
+
+    psilca_price_factor = _validated_factor(psilca_price_factor, "psilca_price_factor")
+    direct_hours_override = {
+        code: _validated_factor(value, f"direct_hours_override[{code!r}]")
+        for code, value in (direct_hours_override or {}).items()
+    }
+    if set(direct_hours_override) & set(hours_override or {}):
+        raise ValueError("Direct hours and monetary labour overrides cannot overlap")
+    if hours_override is not None:
+        hours_override = {
+            code: _validated_factor(value, f"hours_override[{code!r}]")
+            for code, value in hours_override.items()
+        }
+    if productivity_price_factor is None:
+        productivity_price_factor = 1.0
+    else:
+        productivity_price_factor = _validated_factor(
+            productivity_price_factor, "productivity_price_factor"
+        )
+
+    # Price handling. PSILCA intensities are expressed per monetary unit, so
+    # calculating an amount per reference product without a positive product
+    # price is dimensionally invalid. Upstream extraction normally guarantees
+    # this; keep the validation here as the public-function safety boundary.
     enriched_df = enriched_df.copy()
     enriched_df.columns = enriched_df.columns.str.strip()
     if "Price" in enriched_df.columns:
+        originally_missing_price = enriched_df["Price"].isna()
         enriched_df["Price"] = pd.to_numeric(enriched_df["Price"], errors="coerce")
-        price_available = enriched_df["Price"].notna().any()
     else:
-        price_available = False
         enriched_df["Price"] = np.nan
+        originally_missing_price = pd.Series(True, index=enriched_df.index)
 
-    if not price_available:
-        print("⚠️ No price information found. Proceeding without price weighting.")
+    direct_mask = enriched_df["Activity code"].map(
+        lambda code: (norm_code(code) or str(code)) in direct_hours_override
+    )
+    # Missing monetary prices are permitted only with explicit physical hours.
+    enriched_df.loc[direct_mask & originally_missing_price, "Price"] = 0.0
+    invalid_price = (
+        ~np.isfinite(enriched_df["Price"]) | (enriched_df["Price"] <= 0)
+    ) & ~direct_mask
+    invalid_price |= ~np.isfinite(enriched_df["Price"]) | (enriched_df["Price"] < 0)
+    if invalid_price.any():
+        invalid_codes = (
+            enriched_df.loc[invalid_price, "Activity code"]
+            .astype(str)
+            .drop_duplicates()
+            .head(10)
+            .tolist()
+        )
+        suffix = "..." if invalid_price.sum() > len(invalid_codes) else ""
+        raise ValueError(
+            "All activities require a positive finite price before social "
+            f"aggregation. Invalid activity codes: {invalid_codes}{suffix}"
+        )
 
-    # Diagnostics containers
-    per_activity_causes: Dict[str, Counter] = defaultdict(Counter)
-    per_activity_meta: Dict[str, Dict] = {}
-    global_cause_counts: Counter = Counter()
-    global_examples: List[Dict] = []
-    MAX_ACTIVITY_EXAMPLES = 12
-    MAX_GLOBAL_EXAMPLES = 20
+    method = (mean_method or "").strip().lower()
+    if method not in {"geometric", "arithmetic"}:
+        raise ValueError(f"Unknown averaging method: {method!r} (use 'geometric' or 'arithmetic')")
+    geometric = method == "geometric"
 
-    diag_empty_country_sets = 0
-    diag_missing_indicator_country = 0
-    diag_missing_indicator_activity = 0
-    diag_examples_missing: List[Dict] = []
-    tiny_count = 0
+    column_positions = {name: index for index, name in enumerate(enriched_df.columns)}
 
-    def _record_missing(activity_code, activity_name, country, sector, indicator,
-                        qual_level, raw_wh, price, cause, extra=None):
-        per_activity_causes[activity_code][cause] += 1
-        per_activity_meta[activity_code] = {"name": activity_name}
-        global_cause_counts[cause] += 1
-        if len(global_examples) < MAX_GLOBAL_EXAMPLES:
-            global_examples.append({
-                "activity_code": activity_code,
-                "activity_name": activity_name,
-                "country": country,
-                "sector": sector,
-                "indicator": indicator,
-                "risk_level": qual_level,
-                "raw_wh": raw_wh,
-                "price": (float(price) if (price is not None and np.isfinite(price)) else np.nan),
-                "cause": cause,
-                **(extra or {})
-            })
+    def _optional_value(values: tuple[Any, ...], column: str) -> Any:
+        position = column_positions.get(column)
+        return values[position] if position is not None else None
 
-    grouped_by_activity = enriched_df.groupby(["Activity code"], sort=False)
+    records = [
+        _InputRow(
+            activity_code=_optional_value(values, "Activity code"),
+            activity_name=_optional_value(values, "Activity name"),
+            reference_product=_optional_value(values, "Reference product"),
+            isic=_optional_value(values, "ISIC"),
+            unit=_optional_value(values, "Unit"),
+            iso2=_optional_value(values, "ISO2"),
+            price=_optional_value(values, "Price"),
+            country=_optional_value(values, "PSILCA_country"),
+            sector=_optional_value(values, "Matched_sector"),
+            process=_optional_value(values, "PSILCA_process"),
+            exchanges=_optional_value(values, "PSILCA_Exchanges"),
+            country_weight=_optional_value(values, "Country_weight"),
+            weighting_method=_optional_value(values, "Country_weighting_method"),
+            weight_reference_year=_optional_value(values, "Country_weight_reference_year"),
+            weight_data_year=_optional_value(values, "Country_weight_data_year"),
+        )
+        for values in enriched_df.itertuples(index=False, name=None)
+    ]
+    activity_groups: dict[Any, list[_InputRow]] = {}
+    for row in records:
+        activity_code = row.activity_code
+        if pd.isna(activity_code):
+            continue
+        activity_groups.setdefault(activity_code, []).append(row)
 
-    for activity_code, group in grouped_by_activity:
-        activity_meta = group.iloc[0]
-        psilca_countries_used: set = set()
-        psilca_sectors_used: Dict[str, set] = defaultdict(set)
-        country_level_aggregates: List[Dict] = []
-        wh_country_values: List[float] = []
+    activity_codes = list(activity_groups)
+    activity_index = {code: index for index, code in enumerate(activity_codes)}
+    activity_states: list[_ActivityState] = []
 
-        # Activity price
-        price = pd.to_numeric(activity_meta.get("Price", np.nan), errors="coerce")
-        has_price = np.isfinite(price)
-        price_positive = bool(has_price and price > 0)
-        use_price = price_available and price_positive
+    for activity_code, group_rows in activity_groups.items():
+        first_row = group_rows[0]
+        activity_meta = {
+            "Activity name": first_row.activity_name,
+            "Reference product": first_row.reference_product,
+            "ISIC": first_row.isic,
+            "Unit": first_row.unit,
+            "ISO2": first_row.iso2,
+        }
+        price = float(pd.to_numeric(first_row.price, errors="coerce"))
+        if any(float(row.price) != price for row in group_rows):
+            raise ValueError(f"Conflicting prices for activity {activity_code!r}")
+        normalized_code = norm_code(activity_code) or str(activity_code)
+        direct_hours = direct_hours_override.get(normalized_code)
+        override_hours = None
+        if hours_override is not None:
+            candidate = hours_override.get(normalized_code)
+            if candidate is not None and candidate > 0:
+                override_hours = float(candidate)
+        if direct_hours is not None:
+            override_hours = 1.0  # Select the risk-factor-only sector profiles.
 
-        if not has_price:
-            _record_missing(
-                activity_code, activity_meta.get("Activity name"), country=None, sector=None,
-                indicator=None, qual_level=None, raw_wh=None, price=price,
-                cause="price_missing_or_nan"
-            )
-        elif not price_positive:
-            _record_missing(
-                activity_code, activity_meta.get("Activity name"), country=None, sector=None,
-                indicator=None, qual_level=None, raw_wh=None, price=price,
-                cause="price_non_positive"
-            )
+        country_rows: dict[Any, list[_InputRow]] = {}
+        for row in group_rows:
+            country = row.country
+            if pd.isna(country):
+                continue
+            country_rows.setdefault(country, []).append(row)
 
-        # Countries mapped to this activity
-        country_groups = list(group.groupby("PSILCA_country", sort=False))
-        if not country_groups:
-            diag_empty_country_sets += 1
-
-        for psilca_country, sub_df in country_groups:
-            psilca_countries_used.add(psilca_country)
-            exchange_tracker: Dict[tuple, List[float]] = defaultdict(list)
-            wh_values_this_country: List[float] = []
-
-            for _, row in sub_df.iterrows():
-                matched_sector = row.get("Matched_sector")
-                psilca_sectors_used[psilca_country].add(matched_sector)
-
-                sector_exchanges = row.get("PSILCA_Exchanges")
-                if not sector_exchanges or not isinstance(sector_exchanges, list):
-                    _record_missing(
-                        activity_code, activity_meta.get("Activity name"),
-                        country=psilca_country, sector=matched_sector,
-                        indicator=None, qual_level=None, raw_wh=None, price=price,
-                        cause="no_exchanges_for_matched_sector"
-                    )
-                    continue
-
-                for exch in sector_exchanges:
-                    indicator = (exch.get("indicator") or "").strip()
-                    qual_level_raw = (exch.get("risk level") or "").strip()
-                    qual_level = qual_level_raw.lower() if qual_level_raw else ""
-                    exch_type = (exch.get("type") or "risk").strip().lower()
-                    unit = exch.get("unit", "h")
-                    stakeholder_group = exch.get("category", "Unknown")
-                    subcategory = exch.get("subcategory", "Unknown")
-
-                    if not indicator:
-                        _record_missing(
-                            activity_code, activity_meta.get("Activity name"),
-                            country=psilca_country, sector=matched_sector,
-                            indicator=None, qual_level=qual_level_raw, raw_wh=None, price=price,
-                            cause="indicator_missing"
-                        )
-                        continue
-
-                    raw_wh_val = exch.get("meanValue", np.nan)
-                    try:
-                        raw_wh = float(raw_wh_val)
-                    except Exception:
-                        raw_wh = np.nan
-
-                    if not np.isfinite(raw_wh):
-                        _record_missing(
-                            activity_code, activity_meta.get("Activity name"),
-                            country=psilca_country, sector=matched_sector,
-                            indicator=indicator, qual_level=qual_level_raw, raw_wh=raw_wh_val, price=price,
-                            cause="working_hours_missing_or_nan"
-                        )
-                        continue
-                    if raw_wh <= 0:
-                        _record_missing(
-                            activity_code, activity_meta.get("Activity name"),
-                            country=psilca_country, sector=matched_sector,
-                            indicator=indicator, qual_level=qual_level_raw, raw_wh=raw_wh, price=price,
-                            cause="working_hours_non_positive"
-                        )
-                        continue
-
-                    # Risk level / weight mapping
-                    qual_missing = (qual_level in ("", "?", "unknown", None))
-                    weight = level_weights.get(qual_level) if not qual_missing else None
-                    if qual_missing:
-                        _record_missing(
-                            activity_code, activity_meta.get("Activity name"),
-                            country=psilca_country, sector=matched_sector,
-                            indicator=indicator, qual_level=qual_level_raw, raw_wh=raw_wh, price=price,
-                            cause="risk_level_missing_or_unknown"
-                        )
-                        weight = float(level_weights.get("no data", 1.0))
-                    elif weight is None:
-                        _record_missing(
-                            activity_code, activity_meta.get("Activity name"),
-                            country=psilca_country, sector=matched_sector,
-                            indicator=indicator, qual_level=qual_level_raw, raw_wh=raw_wh, price=price,
-                            cause="risk_level_unmapped"
-                        )
-                        weight = float(level_weights.get("no data", 1.0))
-                    else:
-                        weight = float(weight)
-
-                    if weight <= 0:
-                        _record_missing(
-                            activity_code, activity_meta.get("Activity name"),
-                            country=psilca_country, sector=matched_sector,
-                            indicator=indicator, qual_level=qual_level_raw, raw_wh=raw_wh, price=price,
-                            cause="risk_weight_non_positive"
-                        )
-                        continue
-
-                    price_factor = float(price) if use_price else 1.0
-
-                    # Working-hours contribution (no risk weighting)
-                    wh_val = raw_wh * price_factor
-                    if np.isfinite(wh_val) and wh_val > 0:
-                        wh_values_this_country.append(wh_val)
-
-                    # Weighted value for social risk/opportunity
-                    weighted = raw_wh * weight * price_factor
-                    if not np.isfinite(weighted) or weighted <= 0:
-                        _record_missing(
-                            activity_code, activity_meta.get("Activity name"),
-                            country=psilca_country, sector=matched_sector,
-                            indicator=indicator, qual_level=qual_level_raw, raw_wh=raw_wh, price=price,
-                            cause="weighted_non_positive_or_nan",
-                            extra={"weight": weight, "price_factor": price_factor}
-                        )
-                        continue
-
-                    key = (indicator, unit, exch_type, stakeholder_group, subcategory)
-                    type_map[indicator].add(exch_type)
-                    count_map[indicator] += 1
-                    exchange_tracker[key].append(weighted)
-
-            # Mean within country (geometric or arithmetic, depending on config)
-            country_avg: Dict[tuple, float] = {}
-            for key, vals in exchange_tracker.items():
-                avg_val = _aggregate_strict(
-                    vals,
-                    method=mean_method,
-                    context=f"activity={activity_code}, country={psilca_country}, key={key}"
+        country_weight_map: dict[str, float] = {}
+        for country, rows in country_rows.items():
+            if "Country_weight" not in column_positions:
+                continue
+            valid_weights = {
+                numeric_weight
+                for row in rows
+                if math.isfinite(
+                    numeric_weight := float(pd.to_numeric(row.country_weight, errors="coerce"))
                 )
-                if np.isfinite(avg_val) and avg_val > 0:
-                    country_avg[key] = avg_val
-            country_level_aggregates.append(country_avg)
+                and numeric_weight >= 0
+            }
+            if len(valid_weights) > 1:
+                raise ValueError(
+                    f"Inconsistent country weights for activity {activity_code!r}, "
+                    f"country {country!r}"
+                )
+            if valid_weights:
+                country_weight_map[str(country)] = next(iter(valid_weights))
 
-            # Arithmetic mean of working-hours in this country (keep arithmetic)
-            if wh_values_this_country:
-                country_mean_wh = float(np.mean(wh_values_this_country))
-                if np.isfinite(country_mean_wh) and country_mean_wh > 0:
-                    wh_country_values.append(country_mean_wh)
+        total_country_weight = sum(country_weight_map.values())
+        if total_country_weight > 0:
+            country_weight_map = {
+                country: weight / total_country_weight
+                for country, weight in country_weight_map.items()
+            }
+        elif country_rows:
+            equal_weight = 1.0 / len(country_rows)
+            country_weight_map = {str(country): equal_weight for country in country_rows}
 
-        # Combine across countries
-        combined: Dict[tuple, List[float]] = defaultdict(list)
-        for cdict in country_level_aggregates:
-            for key, val in cdict.items():
-                if np.isfinite(val) and val > 0:
-                    combined[key].append(val)
+        weighting_methods = ["equal"]
+        if "Country_weighting_method" in column_positions:
+            weighting_methods = sorted(
+                {
+                    str(method_value)
+                    for row in group_rows
+                    if pd.notna(method_value := row.weighting_method) and str(method_value)
+                }
+            ) or ["equal"]
 
-        final_exchanges: List[Dict[str, Any]] = []
-        for (name, unit, exch_type, stakeholder_group, subcategory), vals in combined.items():
-            vals = [v for v in vals if np.isfinite(v) and v > 0]
-            if len(vals) == 0:
-                diag_missing_indicator_country += 1
-                if len(diag_examples_missing) < 15:
-                    diag_examples_missing.append({
-                        "activity_code": activity_code,
-                        "activity_name": activity_meta.get("Activity name"),
-                        "indicator": name,
-                        "type": exch_type,
-                        "reason": "empty_after_country_aggregation",
-                    })
-                continue
+        reference_year = None
+        if "Country_weight_reference_year" in column_positions:
+            reference_years = {
+                numeric_reference_year
+                for row in group_rows
+                if math.isfinite(
+                    numeric_reference_year := float(
+                        pd.to_numeric(row.weight_reference_year, errors="coerce")
+                    )
+                )
+            }
+            if len(reference_years) == 1:
+                reference_year = int(next(iter(reference_years)))
 
-            avg_val = _aggregate_strict(
-                vals,
-                method=mean_method,
-                context=f"activity={activity_code}, countries={len(vals)}, key={(name, unit, exch_type, stakeholder_group, subcategory)}"
+        data_years: dict[str, int] = {}
+        if "Country_weight_data_year" in column_positions:
+            for country, rows in country_rows.items():
+                years = {
+                    numeric_data_year
+                    for row in rows
+                    if math.isfinite(
+                        numeric_data_year := float(
+                            pd.to_numeric(row.weight_data_year, errors="coerce")
+                        )
+                    )
+                }
+                if len(years) == 1:
+                    data_years[str(country)] = int(next(iter(years)))
+
+        conversion_factor = (
+            productivity_price_factor if override_hours is not None else psilca_price_factor
+        )
+        if direct_hours is not None:
+            conversion_factor = 1.0
+        activity_states.append(
+            _ActivityState(
+                meta=activity_meta,
+                price=price,
+                override_hours=override_hours,
+                direct_hours=direct_hours,
+                conversion_factor=conversion_factor,
+                country_weights=country_weight_map,
+                weighting_methods=weighting_methods,
+                reference_year=reference_year,
+                data_years=data_years,
+                countries=set(),
+                sectors=defaultdict(set),
+                processes=defaultdict(set),
+                diagnostics=Counter(),
             )
-            if not np.isfinite(avg_val) or avg_val <= 0:
-                diag_missing_indicator_activity += 1
-                if len(diag_examples_missing) < 15:
-                    diag_examples_missing.append({
-                        "activity_code": activity_code,
-                        "activity_name": activity_meta.get("Activity name"),
-                        "indicator": name,
-                        "type": exch_type,
-                        "reason": "geometric_mean_nan_or_nonpositive",
-                    })
+        )
+    del activity_groups
+
+    profiles: dict[tuple[Any, Any, int], _SectorProfile] = {}
+    matches_by_country: dict[Any, list[tuple[int, _SectorProfile]]] = {}
+    indicator_keys: list[IndicatorKey] = []
+    indicator_index: dict[IndicatorKey, int] = {}
+
+    for row in records:
+        activity_code = row.activity_code
+        activity_id = activity_index.get(activity_code)
+        country = row.country
+        if activity_id is None or pd.isna(country):
+            continue
+        state = activity_states[activity_id]
+        sector = row.sector
+        state.countries.add(country)
+        state.sectors[country].add(sector)
+        if row.process is not None and not pd.isna(row.process):
+            state.processes[country].add(str(row.process))
+
+        exchanges = row.exchanges
+        if not exchanges or not isinstance(exchanges, list):
+            state.diagnostics["no_exchanges_for_matched_sector"] += 1
+            continue
+
+        # The normal pipeline shares one exchange list for every occurrence of
+        # a source process. Its identity keeps distinct processes with the same
+        # country-sector label separate (also for direct API callers).
+        profile_key = (country, sector, id(exchanges))
+        profile = profiles.get(profile_key)
+        if profile is None:
+            profile = _build_sector_profile(
+                exchanges,
+                level_weights,
+                geometric=geometric,
+            )
+            profiles[profile_key] = profile
+            for key in (*profile.psilca_totals, *profile.override_totals):
+                if key not in indicator_index:
+                    indicator_index[key] = len(indicator_keys)
+                    indicator_keys.append(key)
+
+        if state.override_hours is None:
+            if any(
+                profile.psilca_diagnostics.get(key, 0)
+                for key in (
+                    "working_hours_negative",
+                    "working_hours_missing_or_nan",
+                )
+            ):
+                raise ValueError(
+                    f"Invalid PSILCA worker-hour intensity for activity {activity_code!r}, "
+                    f"country {country!r}, sector {sector!r}"
+                )
+            if profile.inconsistent_hours:
+                raise ValueError(
+                    "Inconsistent PSILCA worker-hour intensities for "
+                    f"activity {activity_code!r}, country {country!r}, "
+                    f"sector {sector!r}: {list(profile.inconsistent_hours)}"
+                )
+            state.diagnostics.update(profile.psilca_diagnostics)
+        else:
+            state.diagnostics.update(profile.override_diagnostics)
+        matches_by_country.setdefault(country, []).append((activity_id, profile))
+    del records
+
+    activity_count = len(activity_states)
+    indicator_count = len(indicator_keys)
+    shape = (activity_count, indicator_count)
+    needs_psilca_profiles = any(state.override_hours is None for state in activity_states)
+    needs_override_profiles = any(state.override_hours is not None for state in activity_states)
+
+    psilca_aggregation = _CrossCountryAggregation.zeros(shape)
+    override_aggregation = _CrossCountryAggregation.zeros(shape)
+    hours_weighted = np.zeros(activity_count, dtype=np.float64)
+    hours_weight_sums = np.zeros(activity_count, dtype=np.float64)
+    hours_unweighted = np.zeros(activity_count, dtype=np.float64)
+    hours_country_counts = np.zeros(activity_count, dtype=np.float64)
+
+    def _country_profile_means(
+        *,
+        grouped_rows: np.ndarray,
+        group_starts: np.ndarray,
+        sorted_sector_rows: np.ndarray,
+        sector_profiles: list[_SectorProfile],
+        totals_attribute: str,
+        counts_attribute: str,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        sector_totals = np.zeros((len(sector_profiles), indicator_count), dtype=np.float64)
+        sector_counts = np.zeros_like(sector_totals)
+        for sector_id, profile in enumerate(sector_profiles):
+            totals: dict[IndicatorKey, float] = getattr(profile, totals_attribute)
+            counts: Counter[IndicatorKey] = getattr(profile, counts_attribute)
+            for key, total in totals.items():
+                column = indicator_index[key]
+                sector_totals[sector_id, column] = total
+                sector_counts[sector_id, column] = counts[key]
+
+        country_totals = np.zeros((len(grouped_rows), indicator_count), dtype=np.float64)
+        country_counts = np.zeros_like(country_totals)
+        country_totals[grouped_rows] = np.add.reduceat(
+            sector_totals[sorted_sector_rows],
+            group_starts,
+            axis=0,
+        )
+        country_counts[grouped_rows] = np.add.reduceat(
+            sector_counts[sorted_sector_rows],
+            group_starts,
+            axis=0,
+        )
+        valid = country_counts > 0
+        country_means = np.zeros_like(country_totals)
+        country_means[valid] = country_totals[valid] / country_counts[valid]
+        return country_means, valid
+
+    for country, matches in matches_by_country.items():
+        active_ids = np.array(list(dict.fromkeys(item[0] for item in matches)), dtype=np.intp)
+        local_index = {activity_id: index for index, activity_id in enumerate(active_ids)}
+        sector_profiles = list(dict.fromkeys(id(item[1]) for item in matches))
+        profile_by_identity = {id(profile): profile for _, profile in matches}
+        profiles_in_order = [profile_by_identity[identity] for identity in sector_profiles]
+        profile_index = {identity: index for index, identity in enumerate(sector_profiles)}
+        local_rows = np.fromiter(
+            (local_index[activity_id] for activity_id, _ in matches),
+            dtype=np.intp,
+            count=len(matches),
+        )
+        sector_rows = np.fromiter(
+            (profile_index[id(profile)] for _, profile in matches),
+            dtype=np.intp,
+            count=len(matches),
+        )
+        stable_order = np.argsort(local_rows, kind="stable")
+        sorted_local_rows = local_rows[stable_order]
+        group_starts = np.flatnonzero(
+            np.concatenate(([True], sorted_local_rows[1:] != sorted_local_rows[:-1]))
+        )
+        grouped_rows = sorted_local_rows[group_starts]
+        sorted_sector_rows = sector_rows[stable_order]
+        country_weight_vector = np.fromiter(
+            (
+                activity_states[activity_id].country_weights.get(str(country), 0.0)
+                for activity_id in active_ids
+            ),
+            dtype=np.float64,
+            count=len(active_ids),
+        )
+
+        if needs_psilca_profiles:
+            country_means, valid = _country_profile_means(
+                grouped_rows=grouped_rows,
+                group_starts=group_starts,
+                sorted_sector_rows=sorted_sector_rows,
+                sector_profiles=profiles_in_order,
+                totals_attribute="psilca_totals",
+                counts_attribute="psilca_counts",
+            )
+            psilca_aggregation.add(active_ids, country_means, valid, country_weight_vector)
+        if needs_override_profiles:
+            country_means, valid = _country_profile_means(
+                grouped_rows=grouped_rows,
+                group_starts=group_starts,
+                sorted_sector_rows=sorted_sector_rows,
+                sector_profiles=profiles_in_order,
+                totals_attribute="override_totals",
+                counts_attribute="override_counts",
+            )
+            override_aggregation.add(active_ids, country_means, valid, country_weight_vector)
+
+        sector_hours = np.array(
+            [
+                profile.working_hours if profile.working_hours is not None else 0.0
+                for profile in profiles_in_order
+            ],
+            dtype=np.float64,
+        )
+        sector_hours_valid = sector_hours > 0
+        country_hours = np.zeros(len(active_ids), dtype=np.float64)
+        country_hours_counts = np.zeros(len(active_ids), dtype=np.float64)
+        country_hours[grouped_rows] = np.add.reduceat(
+            sector_hours[sorted_sector_rows],
+            group_starts,
+        )
+        country_hours_counts[grouped_rows] = np.add.reduceat(
+            sector_hours_valid[sorted_sector_rows].astype(np.float64),
+            group_starts,
+        )
+        hours_valid = country_hours_counts > 0
+        country_hours[hours_valid] /= country_hours_counts[hours_valid]
+        hours_weighted[active_ids] += country_hours * country_weight_vector * hours_valid
+        hours_weight_sums[active_ids] += country_weight_vector * hours_valid
+        hours_unweighted[active_ids] += country_hours * hours_valid
+        hours_country_counts[active_ids] += hours_valid
+
+    psilca_means = psilca_aggregation.finish(exponentiate=geometric)
+    override_means = override_aggregation.finish(exponentiate=geometric)
+    working_hour_means = _CrossCountryAggregation(
+        weighted=hours_weighted,
+        weight_sums=hours_weight_sums,
+        unweighted=hours_unweighted,
+        country_counts=hours_country_counts,
+    ).finish(exponentiate=False)
+
+    final_activities: list[dict[str, Any]] = []
+    for activity_id, activity_code in enumerate(activity_codes):
+        state = activity_states[activity_id]
+        meta = state.meta
+        price = state.price
+        override_hours = state.override_hours
+        conversion_factor = state.conversion_factor
+        price_factor = price * conversion_factor
+        if not math.isfinite(price_factor):
+            raise ValueError(
+                f"Non-finite computed monetary conversion for activity {activity_code!r}"
+            )
+        means = override_means if override_hours is not None else psilca_means
+        country_counts = (
+            override_aggregation.country_counts
+            if override_hours is not None
+            else psilca_aggregation.country_counts
+        )
+        activity_scale = (
+            price_factor * override_hours if override_hours is not None else price_factor
+        )
+        if state.direct_hours is not None:
+            activity_scale = state.direct_hours
+        if not math.isfinite(activity_scale) or np.isinf(means[activity_id]).any():
+            raise ValueError(f"Non-finite computed intensity for activity {activity_code!r}")
+
+        final_exchanges: list[dict[str, Any]] = []
+        for column in np.flatnonzero(np.isfinite(means[activity_id])):
+            mean_value = float(means[activity_id, column]) * activity_scale
+            if not math.isfinite(mean_value):
+                raise ValueError(
+                    f"Non-finite computed indicator {indicator_keys[column][0]!r} "
+                    f"for activity {activity_code!r}"
+                )
+            if not math.isfinite(mean_value) or mean_value <= 0:
                 continue
-
-            # Optional rounding
             if isinstance(rounding, int):
-                rounded = round(avg_val, rounding)
-                value_out = avg_val if (rounded == 0.0 and avg_val > 0.0) else rounded
+                rounded = round(mean_value, rounding)
+                value_out = mean_value if rounded == 0.0 else rounded
             else:
-                value_out = avg_val
+                value_out = mean_value
+            name, _unit, exchange_type, stakeholder_group, subcategory = indicator_keys[column]
+            final_exchanges.append(
+                {
+                    "indicator": name,
+                    "type": exchange_type,
+                    "category": stakeholder_group,
+                    "subcategory": subcategory,
+                    "unit": (
+                        "med opportunity hours"
+                        if exchange_type == "opportunity"
+                        else "med risk hours"
+                    ),
+                    "meanValue": float(value_out),
+                    "origin_matches": int(country_counts[activity_id, column]),
+                }
+            )
 
-            if value_out < tiny_threshold:
-                tiny_count += 1
+        working_hours: float | None
+        if state.direct_hours is not None:
+            working_hours = state.direct_hours
+        elif override_hours is not None:
+            working_hours = override_hours * price_factor
+        else:
+            working_hours = float(working_hour_means[activity_id]) * price_factor
+        if math.isinf(working_hours):
+            raise ValueError(f"Non-finite computed working hours for activity {activity_code!r}")
+        if not math.isfinite(working_hours) or working_hours <= 0:
+            working_hours = None
 
-            # Type mismatch safeguard
-            if exch_type == "risk" and "opportunity" in type_map[name] and count_map[name] > 1:
-                exch_type = "opportunity"
-                out_unit = "med opportunity hours"
-            else:
-                out_unit = "med opportunity hours" if exch_type == "opportunity" else "med risk hours"
-
-            final_exchanges.append({
-                "indicator": name,
-                "type": exch_type,
-                "category": stakeholder_group,
-                "subcategory": subcategory,
-                "unit": out_unit,
-                "meanValue": float(value_out),
-                "origin_matches": len(vals),
-            })
-
-        # Compute working-hours aggregate
-        working_hours_value = None
-        if wh_country_values:
-            wh_vals = [v for v in wh_country_values if np.isfinite(v) and v > 0]
-            if wh_vals:
-                working_hours_value = float(np.mean(wh_vals))
-
-        # Store activity record
-        final_activities.append({
-            "Activity code": activity_code,
-            "Activity name": activity_meta.get("Activity name"),
-            "Reference product": activity_meta.get("Reference product"),
-            "ISIC": activity_meta.get("ISIC"),
-            "Unit": activity_meta.get("Unit"),
-            "ISO2": activity_meta.get("ISO2"),
-            "Price": float(price) if use_price else "N/A",
-            "PSILCA_countries_used": sorted(list(psilca_countries_used)),
-            "PSILCA_sectors_used": {k: sorted(list(v)) for k, v in psilca_sectors_used.items()},
-            "Averaged_Exchanges": final_exchanges,
-            "Working_hours": working_hours_value,
-        })
-
-    # Diagnostics output
-    if per_activity_causes:
-        print("\n🔎 Missing input diagnostics (per activity; limited to a few examples):")
-        shown = 0
-        for act_code, causes in per_activity_causes.items():
-            name = per_activity_meta.get(act_code, {}).get("name", "")
-            cause_str = ", ".join(f"{k}={v}" for k, v in causes.most_common())
-            print(f" - {act_code} | {name} → {cause_str}")
-            shown += 1
-            if shown >= MAX_ACTIVITY_EXAMPLES:
-                print(f"   … and {len(per_activity_causes) - shown} more activities with missing inputs.")
-                break
-
-    if global_cause_counts:
-        print("\n📊 Missing input summary (global):")
-        for cause, n in global_cause_counts.most_common():
-            print(f" - {cause}: {n}")
-
-    if tiny_count:
-        print(f"ℹ️ {tiny_threshold:g}-tiny outputs: {tiny_count} (positive but very small).")
+        final_activities.append(
+            {
+                "Activity code": activity_code,
+                "Activity name": meta.get("Activity name"),
+                "Reference product": meta.get("Reference product"),
+                "ISIC": meta.get("ISIC"),
+                "Unit": meta.get("Unit"),
+                "ISO2": meta.get("ISO2"),
+                "Price": price,
+                "Price_conversion_factor": conversion_factor,
+                "Converted_price": price_factor,
+                "PSILCA_countries_used": sorted(state.countries),
+                "PSILCA_sectors_used": {
+                    country: sorted(sectors) for country, sectors in state.sectors.items()
+                },
+                "PSILCA_processes_used": {
+                    country: sorted(processes) for country, processes in state.processes.items()
+                },
+                "PSILCA_country_weights": dict(sorted(state.country_weights.items())),
+                "Country_weighting_method": "; ".join(state.weighting_methods),
+                "Country_weight_reference_year": state.reference_year,
+                "Country_weight_data_years": dict(sorted(state.data_years.items())),
+                "Input_diagnostics": dict(sorted(state.diagnostics.items())),
+                "Averaged_Exchanges": final_exchanges,
+                "Working_hours": working_hours,
+                "Working_hours_source": (
+                    "treatment_fallback"
+                    if state.direct_hours is not None
+                    else "external_productivity" if override_hours is not None else "psilca"
+                ),
+            }
+        )
 
     return final_activities

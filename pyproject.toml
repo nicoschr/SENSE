@@ -4,13 +4,15 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sense-lca"
-version = "0.1.0"
-description = "Social-Economic-Nexus for Sustainability Evaluation - Integrate PSILCA social LCA data into ecoinvent using Brightway2"
+version = "1.1.0"
+description = "Social and environmental nexus for sustainability evaluation using PSILCA, ecoinvent, and Brightway"
 readme = "README.md"
 license = "MIT"
-requires-python = "==3.11.8"
+requires-python = ">=3.11,<3.12"
 authors = [
-    { name = "SENSE Contributors" },
+    { name = "Nicolas Schröder" },
+    { name = "Fabian Lechtenberg" },
+    { name = "Gonzalo Guillén Gosálbez" },
 ]
 keywords = [
     "life-cycle-assessment",
@@ -28,31 +30,23 @@ classifiers = [
     "Environment :: Console",
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: MIT License",
-    "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering",
     "Topic :: Scientific/Engineering :: Information Analysis",
 ]
 
 dependencies = [
     "bw2data==3.6.6",
-    "bw2io==0.8.12",
-    "bw2calc==1.8.2",
-    "numpy>=1.21",
+    "filelock>=3.13",
+    "numpy>=1.21,<2",
+    # Arrow 26 requires NumPy >=2, incompatible with this Brightway stack.
+    "pyarrow>=10.0,<26",
     "pandas>=1.3",
-    "sentence-transformers>=2.0",
+    "sentence-transformers>=3.4.1",
     "tqdm>=4.60",
     "xmltodict>=0.13",
     "openpyxl>=3.0",
-    "regioinvent==1.3.0",
-    "wurst==0.4",
-    'pypardiso==0.4.7; platform_system=="Windows"',
-    'scikit-umfpack; platform_system=="Darwin"',
-    "geopandas==1.1.2",
     "pycountry==24.6.1",
 ]
 
@@ -63,37 +57,257 @@ dev = [
     "black>=23.0",
     "ruff>=0.1",
     "mypy>=1.0",
-    "pre-commit>=3.0",
+    "build>=1.0",
+    "PyYAML>=6.0",
 ]
-docs = [
-    "sphinx>=6.0",
-    "sphinx-rtd-theme>=1.0",
-    "myst-parser>=2.0",
+ecoinvent-import = [
+    "bw2io==0.8.12",
+    "bw2calc==1.8.2",
+]
+# Fast sparse solver for bw2calc, selected per platform at install time.
+# bw2calc prefers pypardiso (Intel MKL PARDISO) and otherwise falls back to
+# SciPy, which routes through UMFPACK automatically when scikit-umfpack is
+# importable. MKL does not exist for Apple Silicon, and scikit-umfpack has no
+# prebuilt wheel compatible with numpy<2, so the two are complementary:
+# pypardiso on Windows/Linux x86-64, a scikit-umfpack source build on macOS.
+fast-solver = [
+    "pypardiso>=0.4.5; (sys_platform == 'linux' or sys_platform == 'win32') and (platform_machine == 'x86_64' or platform_machine == 'AMD64')",
+    "scikit-umfpack>=0.4.2; sys_platform == 'darwin'",
+]
+tutorial = ["jupyterlab>=4.0", "ipykernel>=6.0", "bw2calc==1.8.2"]
+case-study = [
+    "brightway2==2.4.7",
+    "bw2analyzer==0.10",
+    "bw2calc==1.8.2",
+    "bw2io==0.8.12",
+    "geopandas==1.1.2",
+    "matplotlib>=3.10",
+    "PyYAML>=6.0",
+    "regioinvent==1.4.0.2",
+    "sense-lca[fast-solver]",
+    "wurst==0.4",
 ]
 
 [project.urls]
 Homepage = "https://github.com/nicoschr/SENSE"
+Repository = "https://github.com/nicoschr/SENSE"
+Issues = "https://github.com/nicoschr/SENSE/issues"
+Documentation = "https://github.com/nicoschr/SENSE#readme"
 
 [project.scripts]
 sense = "sense.cli:main"
 
+# Explicit release allowlists: add files only after content and rights review.
 [tool.hatch.build.targets.wheel]
-packages = ["src/sense"]
+only-include = [
+    "src/sense/__init__.py",
+    "src/sense/artifacts.py",
+    "src/sense/brightway/__init__.py",
+    "src/sense/brightway/flows.py",
+    "src/sense/brightway/methods.py",
+    "src/sense/brightway/repository.py",
+    "src/sense/brightway/state.py",
+    "src/sense/cli.py",
+    "src/sense/config.py",
+    "src/sense/core/__init__.py",
+    "src/sense/core/averaging.py",
+    "src/sense/core/matching.py",
+    "src/sense/core/working_hours.py",
+    "src/sense/core/treatment.py",
+    "src/sense/data/__init__.py",
+    "src/sense/data/ecoinvent.py",
+    "src/sense/data/embeddings.py",
+    "src/sense/data/price_inference.py",
+    "src/sense/data/psilca.py",
+    "src/sense/data/zolca_reader.py",
+    "src/sense/data/psilca_zolca.py",
+    "src/sense/resources/zolca/reader.jar",
+    "src/sense/resources/zolca/reader-build.json",
+    "src/sense/resources/zolca/ArchiveResources.java",
+    "src/sense/resources/zolca/SenseZolcaReader.java",
+    "src/sense/diagnostics.py",
+    "src/sense/economics.py",
+    "src/sense/eligibility.py",
+    "src/sense/exceptions.py",
+    "src/sense/geography.py",
+    "src/sense/monetary.py",
+    "src/sense/preparation.py",
+    "src/sense/labour_reference.py",
+    "src/sense/regional.py",
+    "src/sense/data/prices.py",
+    "src/sense/data/seed_prices.py",
+    "src/sense/pipeline.py",
+    "src/sense/productivity/__init__.py",
+    "src/sense/productivity/geography.py",
+    "src/sense/productivity/loader.py",
+    "src/sense/resources/THIRD_PARTY_NOTICES.txt",
+    "src/sense/resources/__init__.py",
+    "src/sense/resources/world_bank_gdp_current_usd_2000_2024.csv",
+    "src/sense/resources/imf_weo_gdp_current_usd_2000_2024.csv",
+    "src/sense/resources/imf_weo_gdp_current_usd_2000_2024.json",
+    "src/sense/run_context.py",
+    "src/sense/utils/__init__.py",
+    "src/sense/utils/cache.py",
+    "src/sense/utils/locking.py",
+    "src/sense/utils/helpers.py",
+    "src/sense/weighting.py"
+]
+sources = ["src"]
 
 [tool.hatch.build.targets.sdist]
-include = [
-    "/src",
-    "/README.md",
-    "/LICENSE",
+only-include = [
+    "tests/conftest.py",
+    "tests/test_release_state.py",
+    ".github/workflows/ci.yml",
+    ".gitattributes",
+    ".gitignore",
+    "CITATION.cff",
+    "LICENSE",
+    "README.md",
+    "CHANGELOG.md",
+    "docs/package-reference.md",
+    "docs/assets/SENSE_logo_text.svg",
+    "case_studies/hydrogen/README.md",
+    "case_studies/hydrogen/REFERENCE.md",
+    "case_studies/__init__.py",
+    "case_studies/hydrogen/__init__.py",
+    "case_studies/hydrogen/run.py",
+    "examples/apply_sense.py",
+    "examples/calculate_scores.py",
+    "examples/getting_started.ipynb",
+    "tests/test_hydrogen_runner.py",
+    "case_studies/hydrogen/workflow/__init__.py",
+    "case_studies/hydrogen/workflow/backgrounds.py",
+    "case_studies/hydrogen/workflow/benchmark_comparison.py",
+    "case_studies/hydrogen/workflow/foreground_construction.py",
+    "case_studies/hydrogen/workflow/soca.py",
+    "case_studies/hydrogen/workflow/inventory_operations.py",
+    "case_studies/hydrogen/workflow/benchmark.py",
+    "case_studies/hydrogen/workflow/calculate.py",
+    "case_studies/hydrogen/workflow/carbon_methods.py",
+    "case_studies/hydrogen/workflow/result_archive.py",
+    "case_studies/hydrogen/workflow/case_config.py",
+    "case_studies/hydrogen/workflow/comparison_plots.py",
+    "case_studies/hydrogen/workflow/contribution_data.py",
+    "case_studies/hydrogen/workflow/contribution_plot.py",
+    "case_studies/hydrogen/workflow/figure_io.py",
+    "case_studies/hydrogen/workflow/figures.py",
+    "case_studies/hydrogen/workflow/foreground_import.py",
+    "case_studies/hydrogen/workflow/foregrounds.py",
+    "case_studies/hydrogen/workflow/inventory_localization.py",
+    "case_studies/hydrogen/workflow/paired_prices.py",
+    "case_studies/hydrogen/workflow/paired_results.py",
+    "case_studies/hydrogen/workflow/regionalization.py",
+    "case_studies/hydrogen/workflow/regionalization_summary.py",
+    "case_studies/hydrogen/workflow/social.py",
+    "case_studies/hydrogen/workflow/study_checks.py",
+    "case_studies/hydrogen/workflow/study_inputs.py",
+    "case_studies/hydrogen/workflow/study_protocol.py",
+    "case_studies/hydrogen/workflow/study_runs.py",
+    "case_studies/hydrogen/workflow/si_carbon.py",
+    "case_studies/hydrogen/workflow/si_common.py",
+    "case_studies/hydrogen/workflow/si_coverage.py",
+    "case_studies/hydrogen/workflow/si_matching.py",
+    "case_studies/hydrogen/workflow/si_missing.py",
+    "case_studies/hydrogen/workflow/si_productivity.py",
+    "case_studies/hydrogen/workflow/si_productivity_plot.py",
+    "case_studies/hydrogen/workflow/si_tables.py",
+    "case_studies/hydrogen/resources/matching_audit/encoder_metrics.csv",
+    "case_studies/hydrogen/resources/matching_audit/provenance.json",
+    "case_studies/hydrogen/resources/matching_audit/threshold_curve.csv",
+    "tests/test_hydrogen_si.py",
+    "case_studies/hydrogen/check_setup.py",
+    "case_studies/hydrogen/config.yaml.template",
+    "case_studies/hydrogen/audit_indicators.py",
+    "case_studies/hydrogen/fetch_open_data.py",
+    "environment-macos.yml",
+    "environment.yml",
+    "pyproject.toml",
+    "src/sense/__init__.py",
+    "src/sense/artifacts.py",
+    "src/sense/brightway/__init__.py",
+    "src/sense/brightway/flows.py",
+    "src/sense/brightway/methods.py",
+    "src/sense/brightway/repository.py",
+    "src/sense/brightway/state.py",
+    "src/sense/cli.py",
+    "src/sense/config.py",
+    "src/sense/core/__init__.py",
+    "src/sense/core/averaging.py",
+    "src/sense/core/matching.py",
+    "src/sense/core/working_hours.py",
+    "src/sense/core/treatment.py",
+    "src/sense/data/__init__.py",
+    "src/sense/data/ecoinvent.py",
+    "src/sense/data/embeddings.py",
+    "src/sense/data/price_inference.py",
+    "src/sense/data/psilca.py",
+    "src/sense/data/zolca_reader.py",
+    "src/sense/data/psilca_zolca.py",
+    "src/sense/resources/zolca/reader.jar",
+    "src/sense/resources/zolca/reader-build.json",
+    "src/sense/resources/zolca/ArchiveResources.java",
+    "src/sense/resources/zolca/SenseZolcaReader.java",
+    "src/sense/diagnostics.py",
+    "src/sense/economics.py",
+    "src/sense/eligibility.py",
+    "src/sense/exceptions.py",
+    "src/sense/geography.py",
+    "src/sense/monetary.py",
+    "src/sense/preparation.py",
+    "src/sense/labour_reference.py",
+    "src/sense/regional.py",
+    "src/sense/data/prices.py",
+    "src/sense/data/seed_prices.py",
+    "src/sense/pipeline.py",
+    "src/sense/productivity/__init__.py",
+    "src/sense/productivity/geography.py",
+    "src/sense/productivity/loader.py",
+    "src/sense/resources/THIRD_PARTY_NOTICES.txt",
+    "src/sense/resources/__init__.py",
+    "src/sense/resources/world_bank_gdp_current_usd_2000_2024.csv",
+    "src/sense/resources/imf_weo_gdp_current_usd_2000_2024.csv",
+    "src/sense/resources/imf_weo_gdp_current_usd_2000_2024.json",
+    "src/sense/run_context.py",
+    "src/sense/utils/__init__.py",
+    "src/sense/utils/cache.py",
+    "src/sense/utils/locking.py",
+    "src/sense/utils/helpers.py",
+    "src/sense/weighting.py",
+    "tests/run_setup_smoke.py",
+    "tests/test_architecture.py",
+    "tests/test_repository_cleanup.py",
+    "tests/test_audit_regressions.py",
+    "tests/test_hydrogen_case_config.py",
+    "tests/test_hydrogen_carbon.py",
+    "tests/test_hydrogen_figures.py",
+    "tests/test_hydrogen_contributions.py",
+    "tests/test_hydrogen_paired.py",
+    "tests/test_hydrogen_thresholds.py",
+    "tests/test_monetary.py",
+    "tests/test_pipeline_safety.py",
+    "tests/test_treatment_fallback.py",
+    "tests/test_productivity_only.py",
+    "tests/test_psilca_cache.py",
+    "tests/test_release_regressions.py",
+    "tests/test_weighting.py",
+    "tests/test_gdp_coverage_regression.py",
+    "tests/test_imf_gdp.py",
+    "tests/test_gdp_omission_policy.py",
+    "tools/build_imf_gdp_snapshot.py",
+    "tools/build_zolca_reader.py",
+    "tests/test_psilca_zolca.py",
+    "tests/fixtures/zolca/SyntheticSocialDatabase.java",
+    "tests/fixtures/zolca/synthetic_fixture.jar"
 ]
 
 [tool.black]
 line-length = 100
-target-version = ["py39", "py310", "py311", "py312"]
+target-version = ["py311"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py39"
+target-version = "py311"
 
 [tool.ruff.lint]
 select = [
@@ -121,5 +335,4 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
-addopts = "-v --cov=sense --cov-report=term-missing"
+addopts = "-v --cov=sense --cov-report=term-missing --cov-fail-under=50"

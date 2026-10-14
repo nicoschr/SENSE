@@ -1,0 +1,41 @@
+{
+  "api_urls": {
+    "countries": "https://www.imf.org/external/datamapper/api/v1/countries",
+    "data": "https://www.imf.org/external/datamapper/api/v1/NGDPD",
+    "indicators": "https://www.imf.org/external/datamapper/api/v1/indicators"
+  },
+  "conversion_factor": 1000000000,
+  "countries": 197,
+  "country_code_aliases": {
+    "UVK": "XKX",
+    "WBG": "PSE"
+  },
+  "indicator": "NGDPD",
+  "indicator_metadata": {
+    "dataset": "WEO",
+    "description": "Gross domestic product is the most commonly used single measure of a country's overall economic activity. It represents the total value at current prices of final goods and services produced within a country during a specified time period, such as one year.",
+    "label": "GDP, current prices",
+    "last-modified": "2026-04-08 16:07:35",
+    "source": "World Economic Outlook (April 2026)",
+    "unit": "Billions of U.S. dollars"
+  },
+  "input_sha256": {
+    "countries": "f74b5bc5eeb69f3da3edcd19caaab95d94f02a476c1382590a77024164d3b836",
+    "data": "dc7ed5efe35955cc072127c7c80a294f905a06efdf823e35c763e0db2ffd43f1",
+    "indicators": "7a9f9cad706b09f6fa035b14b89aa6365919c5a87a43ef1118d6fa0ca92574a7"
+  },
+  "license": "IMF terms for use of statistical data; separate from SENSE MIT license",
+  "note": "Historical WEO estimates; not necessarily directly measured observations. Years after 2024 and regional totals excluded. SENSE converts billions to dollars and derives weights; these transformations are not IMF products.",
+  "original_unit": "Billions of U.S. dollars",
+  "rows": 4863,
+  "sha256": "b2cb4fd7449d7fe752b2d15b282dab4c4d44be68c9a9e89b337177e48e1887f2",
+  "source": "World Economic Outlook (April 2026)",
+  "source_id": "imf_weo",
+  "source_url": "https://www.imf.org/external/datamapper/NGDPD@WEO",
+  "terms_url": "https://www.imf.org/en/about/copyright-and-terms",
+  "unit": "current US dollars",
+  "year_range": [
+    2000,
+    2024
+  ]
+}

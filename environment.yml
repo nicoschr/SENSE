@@ -1,0 +1,34 @@
+# Tested compatibility pins; known ML advisories remain.
+# See docs/package-reference.md for input requirements and safety.
+name: sense
+# Windows and Linux x86-64. On macOS use environment-macos.yml.
+#
+# `nodefaults` keeps every conda package on conda-forge regardless of the
+# user's global channel configuration. A solve that straddles conda-forge and
+# defaults can produce an OpenMP/MKL runtime that leaves PyTorch unimportable.
+# Setting `conda config --set channel_priority strict` is still recommended.
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.11.15
+  - pip
+  # Native PSILCA .zolca import, without openLCA or XML export.
+  - openjdk=21
+  # Keep numerical and ML libraries on one conda-forge OpenMP runtime. Mixing
+  # these with PyPI wheels can abort the Jupyter kernel on macOS.
+  - numpy=1.26.4
+  # CPU build: the workflow does not use a GPU, and the CUDA variant adds
+  # several gigabytes of libraries.
+  - pytorch=2.5.1=cpu*
+  - scikit-learn=1.6.1
+  # Fast sparse solver for bw2calc (Intel MKL PARDISO). Taken from conda-forge
+  # so that it shares the environment's MKL rather than pulling a second copy
+  # from PyPI.
+  - pypardiso
+  - pip:
+      # Use the same NumPy 1.x-compatible wheel on all supported platforms.
+      - pyarrow==25.0.1
+      - sentence-transformers==3.4.1
+      - transformers==4.48.3
+      - -e .[ecoinvent-import]

@@ -1,0 +1,31 @@
+# Tested compatibility pins; known ML advisories remain.
+# See docs/package-reference.md for input requirements and safety.
+# Intel and Apple Silicon macOS: use UMFPACK.
+# Windows and Linux use environment.yml with PARDISO.
+# Source build requires Xcode command line tools.
+name: sense
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.11.15
+  - pip
+  # Native PSILCA .zolca import, without openLCA or XML export.
+  - openjdk=21
+  - suitesparse
+  # Keep numerical and ML libraries on one conda-forge OpenMP runtime. Mixing
+  # these with PyPI wheels can abort the Jupyter kernel on macOS.
+  - numpy=1.26.4
+  - libumfpack=6.3.5
+  - c-compiler
+  - pkg-config
+  - swig
+  - pytorch=2.5.1=cpu*
+  - scikit-learn=1.6.1
+  - pip:
+      # Use the same NumPy 1.x-compatible wheel on all supported platforms.
+      - pyarrow==25.0.1
+      - scikit-umfpack==0.4.2
+      - sentence-transformers==3.4.1
+      - transformers==4.48.3
+      - -e .[ecoinvent-import]

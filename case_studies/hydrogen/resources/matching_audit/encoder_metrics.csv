@@ -1,0 +1,9 @@
+model,split,n,top1,hit10,mrr
+sentence-transformers/all-MiniLM-L6-v2,dev,150,0.66,0.9866666666666667,0.7684206349206348
+sentence-transformers/all-MiniLM-L6-v2,test,100,0.71,0.96,0.7950515873015873
+BAAI/bge-base-en-v1.5,dev,150,0.78,0.9866666666666667,0.8657777777777774
+BAAI/bge-base-en-v1.5,test,100,0.81,1.0,0.8925
+sentence-transformers/all-mpnet-base-v2,dev,150,0.62,0.96,0.7455185185185185
+sentence-transformers/all-mpnet-base-v2,test,100,0.66,0.91,0.7640833333333333
+baseline/tfidf_char_wb_3_5,dev,150,0.5266666666666666,0.8333333333333334,0.607968253968254
+baseline/tfidf_char_wb_3_5,test,100,0.46,0.77,0.5509166666666667
